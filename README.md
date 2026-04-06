@@ -1,6 +1,3 @@
-> [!WARNING]
-> In today's market, this bot is not profitable and will lose money. Use it as a reference implementation for building your own market making strategies, not as a ready-to-deploy solution. Given the increased competition on Polymarket, I don't see a point in playing with this unless you're willing to dedicate a significant amount of time.
- 
 # Poly-Maker
 
 A market making bot for Polymarket prediction markets. This bot automates the process of providing liquidity to markets on Polymarket by maintaining orders on both sides of the book with configurable parameters. A summary of my experience running this bot is available [here](https://x.com/defiance_cr/status/1906774862254800934)
@@ -135,7 +132,10 @@ This should run continuously in the background (preferably on a different IP tha
 ```bash
 uv run python main.py
 ```
+> [!WARNING]
+> In today's market, this bot is not profitable and will lose money. Use it as a reference implementation for building your own market making strategies, not as a ready-to-deploy solution. Given the increased competition on Polymarket, I don't see a point in playing with this unless you're willing to dedicate a significant amount of time.
 
+ 
 ## Configuration
 
 The bot is configured via a Google Spreadsheet with several worksheets:
