@@ -104,6 +104,7 @@ bus.set_fire_callback(coordinator.ingest)
 # ── feeds ───────────────────────────────────────────────────────────
 
 from feeds.gamma import GammaPoller
+from feeds.gamma_discovery import GammaDiscoveryPoller
 from feeds.oracle import OraclePoller
 from feeds.cross_market import CrossMarketPoller
 from feeds.whale import WhalePoller
@@ -116,6 +117,15 @@ gamma_poller = GammaPoller([], category_det, theta_det)
 oracle_poller = OraclePoller(config, news_det)
 cross_market_poller = CrossMarketPoller(config, cross_market_det)
 whale_poller = WhalePoller(config, whale_det)
+gamma_discovery = GammaDiscoveryPoller(oracle_poller, news_det)
+
+# Register any oracle mappings declared in the config file so the news
+# detector has something to compare market midpoints against.
+for _cid, _spec in config.oracle_mappings.items():
+    _kwargs = {k: v for k, v in _spec.items() if k != "source"}
+    oracle_poller.set_mapping(_cid, _spec.get("source", "coingecko"), **_kwargs)
+if config.oracle_mappings:
+    print(f"[grid] registered {len(config.oracle_mappings)} oracle mappings")
 
 # ── websocket integration ───────────────────────────────────────────
 
@@ -142,11 +152,25 @@ def _enrich_event(json_data: dict) -> dict:
 
 async def connect_grid_market_ws(tokens: list) -> None:
     """Market websocket that feeds both the existing processor and the
-    detector grid event bus."""
+    detector grid event bus.  Closes itself when the discovery poller
+    signals that new subscriptions are pending."""
     uri = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     async with websockets.connect(uri, ping_interval=5, ping_timeout=None) as ws:
         await ws.send(json.dumps({"assets_ids": tokens}))
         print(f"[grid] subscribed to {len(tokens)} market tokens")
+
+        async def _watch_dirty() -> None:
+            """Close the ws when gamma_discovery has new tokens to
+            subscribe to, forcing the main loop to reconnect."""
+            while True:
+                await asyncio.sleep(5)
+                if gamma_discovery.subscription_dirty.is_set():
+                    gamma_discovery.subscription_dirty.clear()
+                    print("[grid] subscription update pending — reconnecting")
+                    await ws.close()
+                    return
+
+        watcher = asyncio.create_task(_watch_dirty())
         try:
             while True:
                 raw = await ws.recv()
@@ -165,7 +189,8 @@ async def connect_grid_market_ws(tokens: list) -> None:
             print(f"[grid] market ws error: {exc}")
             traceback.print_exc()
         finally:
-            await asyncio.sleep(5)
+            watcher.cancel()
+            await asyncio.sleep(1)
 
 
 async def connect_grid_user_ws() -> None:
@@ -209,9 +234,19 @@ async def connect_grid_user_ws() -> None:
 def _background_polling() -> None:
     """Background thread: polls feeds, checks paper exits, resets daily."""
     last_daily_reset = time.time()
+    last_discovery = 0.0
+    DISCOVERY_INTERVAL = 300.0  # 5 minutes
     while True:
         time.sleep(10)
         try:
+            # Gamma-based discovery: find new threshold markets and
+            # register them so the grid picks them up on the next
+            # reconnect, without any operator intervention.
+            now = time.time()
+            if now - last_discovery > DISCOVERY_INTERVAL:
+                gamma_discovery.poll()
+                last_discovery = now
+
             # Feed polls
             gamma_poller.poll()
             oracle_poller.poll()
