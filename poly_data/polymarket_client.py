@@ -301,13 +301,15 @@ class PolymarketClient:
             Exception: If the merge operation fails
         """
         amount_to_merge_str = str(amount_to_merge)
+        neg_risk_flag = "true" if is_neg_risk_market else "false"
 
         # Prepare the command to run the JavaScript script
-        node_command = f'node poly_merger/merge.js {amount_to_merge_str} {condition_id} {"true" if is_neg_risk_market else "false"}'
-        print(node_command)
+        # Use list form to avoid shell injection via condition_id or amount
+        cmd = ["node", "poly_merger/merge.js", amount_to_merge_str, str(condition_id), neg_risk_flag]
+        print(f"Running merge: {' '.join(cmd)}")
 
         # Run the command and capture the output
-        result = subprocess.run(node_command, shell=True, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
         
         # Check if there was an error
         if result.returncode != 0:
