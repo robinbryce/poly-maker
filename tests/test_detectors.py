@@ -244,8 +244,8 @@ class TestCoordinator:
 
         entries = []
 
-        def capture_entry(market, token_id, direction, confidence, meta):
-            entries.append((market, direction, meta))
+        def capture_entry(market, token_id, direction, confidence, meta, cid):
+            entries.append((market, direction, meta, cid))
 
         cfg = GridConfig(min_signals=3, direction_threshold=0.6)
         coord = Coordinator(cfg, capture_entry)
@@ -256,11 +256,12 @@ class TestCoordinator:
             SignalFire("velocity", "mkt1", "tok1", Direction.BUY, 0.9, now),
             SignalFire("disposition", "mkt1", "tok1", Direction.BUY, 0.7, now),
         ]
-        coord.ingest(fires)
+        coord.ingest_sync(fires)
 
         assert len(entries) == 1
         assert entries[0][1] == Direction.BUY
         assert entries[0][2]["n_signals"] == 3
+        assert len(entries[0][3]) > 0  # correlation_id
 
     def test_no_entry_with_only_2_signals(self):
         from grid.coordinator import Coordinator
@@ -270,7 +271,7 @@ class TestCoordinator:
         coord = Coordinator(cfg, lambda *a: entries.append(a))
 
         now = time.time()
-        coord.ingest([
+        coord.ingest_sync([
             SignalFire("volume", "mkt1", "tok1", Direction.BUY, 0.8, now),
             SignalFire("velocity", "mkt1", "tok1", Direction.BUY, 0.9, now),
         ])
@@ -284,7 +285,7 @@ class TestCoordinator:
         coord = Coordinator(cfg, lambda *a: entries.append(a))
 
         now = time.time()
-        coord.ingest([
+        coord.ingest_sync([
             SignalFire("a", "mkt1", "tok1", Direction.BUY, 0.8, now),
             SignalFire("b", "mkt1", "tok1", Direction.BUY, 0.9, now),
             SignalFire("c", "mkt1", "tok1", Direction.BUY, 0.7, now),
@@ -304,11 +305,10 @@ class TestCoordinator:
             SignalFire("b", "mkt1", "tok1", Direction.BUY, 0.9, now),
             SignalFire("c", "mkt1", "tok1", Direction.BUY, 0.7, now),
         ]
-        coord.ingest(batch)
+        coord.ingest_sync(batch)
         assert len(entries) == 1
 
-        # Second batch on same market should be blocked.
-        coord.ingest(batch)
+        coord.ingest_sync(batch)
         assert len(entries) == 1
 
     def test_daily_loss_cap(self):
@@ -324,17 +324,15 @@ class TestCoordinator:
             SignalFire("b", "mkt1", "tok1", Direction.BUY, 0.9, now),
             SignalFire("c", "mkt1", "tok1", Direction.BUY, 0.7, now),
         ]
-        coord.ingest(batch)
+        coord.ingest_sync(batch)
         assert len(entries) == 1
 
-        # Simulate a loss that exceeds the cap.
-        coord.mark_closed("mkt1", -15.0)
+        coord.mark_closed_sync("mkt1", -15.0)
 
-        # New market should be blocked by loss cap.
         batch2 = [
             SignalFire("a", "mkt2", "tok2", Direction.SELL, 0.8, now),
             SignalFire("b", "mkt2", "tok2", Direction.SELL, 0.9, now),
             SignalFire("c", "mkt2", "tok2", Direction.SELL, 0.7, now),
         ]
-        coord.ingest(batch2)
-        assert len(entries) == 1  # still 1, no new entry
+        coord.ingest_sync(batch2)
+        assert len(entries) == 1

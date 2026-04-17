@@ -1,19 +1,20 @@
-"""
-Grid coordinator.
+"""Grid coordinator with asyncio lock, audit log, correlation IDs,
+UTC daily reset, and per-category concentration caps (P1).
 
-Ingests signal fires, maintains rolling per-market state, and decides
-when to trigger an entry.  Enforces kill-switch, risk caps, and the
-one-position-per-market rule.
+All mutating paths acquire a single ``asyncio.Lock``.  A ``_sync``
+variant is retained for tests that don't run an event loop.
 """
 
 from __future__ import annotations
 
-import time
+import asyncio
+import datetime
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set
 
 from detectors.base import Direction, SignalFire
 from grid.config import GridConfig
 from grid.state import GridState
+from ledger.store import new_correlation_id
 
 if TYPE_CHECKING:
     from ledger.store import LedgerStore
@@ -23,55 +24,87 @@ class Coordinator:
     def __init__(
         self,
         config: GridConfig,
-        on_entry: Callable[[str, str, Direction, float, dict], None],
+        on_entry,  # (market, token_id, direction, confidence, meta, correlation_id)
         ledger: Optional["LedgerStore"] = None,
+        category_of: Optional[Callable[[str], Optional[str]]] = None,
     ):
         self.config = config
         self._state = GridState(config.signal_staleness_secs)
-        self._on_entry = on_entry  # (market, token_id, direction, confidence, meta)
+        self._on_entry = on_entry
         self._ledger = ledger
+        self._category_of = category_of or (lambda _m: None)
 
-        # Tracks markets with an active grid-managed position or pending entry.
         self._open_markets: Set[str] = set()
+        self._open_categories: Dict[str, str] = {}
 
-        # Risk counters (reset daily by the main loop).
         self.daily_loss_usdc: float = 0.0
         self.consecutive_losses: int = 0
+        self._last_reset_utc_date = self._today_utc()
 
-    # ── ingest fires ────────────────────────────────────────────────
+        self._lock = asyncio.Lock()
 
-    def ingest(self, fires: List[SignalFire]) -> None:
-        """Called by the event bus with new signal fires."""
+    # snapshot / restore --------------------------------------------
+
+    def snapshot(self) -> dict:
+        return {
+            "open_markets": sorted(self._open_markets),
+            "open_categories": dict(self._open_categories),
+            "daily_loss_usdc": self.daily_loss_usdc,
+            "consecutive_losses": self.consecutive_losses,
+            "last_reset_utc_date": self._last_reset_utc_date,
+        }
+
+    def restore(self, data: dict) -> None:
+        self._open_markets = set(data.get("open_markets", []))
+        self._open_categories = dict(data.get("open_categories", {}))
+        self.daily_loss_usdc = float(data.get("daily_loss_usdc", 0.0))
+        self.consecutive_losses = int(data.get("consecutive_losses", 0))
+        self._last_reset_utc_date = data.get(
+            "last_reset_utc_date", self._today_utc()
+        )
+
+    # ingest --------------------------------------------------------
+
+    async def ingest(self, fires: List[SignalFire]) -> None:
+        async with self._lock:
+            self._ingest_inner(fires)
+
+    def ingest_sync(self, fires: List[SignalFire]) -> None:
+        self._ingest_inner(fires)
+
+    def _ingest_inner(self, fires: List[SignalFire]) -> None:
+        self._maybe_daily_reset()
         for fire in fires:
-            ms = self._state.get(fire.market)
-            ms.update(fire)
-
+            self._state.get(fire.market).update(fire)
             if self._ledger:
                 self._ledger.log_signal_fire(fire)
-
-        # Evaluate every market that received a fire this tick.
         seen: set = set()
         for fire in fires:
-            if fire.market not in seen:
-                seen.add(fire.market)
-                self._evaluate(fire.market)
+            if fire.market in seen:
+                continue
+            seen.add(fire.market)
+            self._evaluate(fire.market)
 
-    # ── core evaluation ─────────────────────────────────────────────
+    # evaluate ------------------------------------------------------
 
     def _evaluate(self, market: str) -> None:
         if self.config.kill_switch:
+            self._audit("kill_switch", market)
             return
-
         if market in self._open_markets:
+            self._audit("already_open", market)
             return
-
         if len(self._open_markets) >= self.config.max_open_positions:
+            self._audit("max_open_positions", market,
+                        {"limit": self.config.max_open_positions})
             return
-
         if self.daily_loss_usdc >= self.config.daily_loss_cap_usdc:
+            self._audit("daily_loss_cap", market,
+                        {"loss_usdc": self.daily_loss_usdc})
             return
-
         if self.consecutive_losses >= self.config.consecutive_loss_cap:
+            self._audit("consecutive_loss_cap", market,
+                        {"losses": self.consecutive_losses})
             return
 
         ms = self._state.get(market)
@@ -81,44 +114,86 @@ class Coordinator:
 
         direction, agreement = ms.dominant_direction()
         if direction is None or agreement < self.config.direction_threshold:
+            self._audit("direction_threshold", market,
+                        {"agreement": agreement})
             return
 
-        # All checks passed — trigger entry.
-        avg_confidence = sum(f.confidence for f in active) / len(active)
+        category = self._category_of(market)
+        max_cat = getattr(self.config, "max_open_per_category", 0)
+        if category and max_cat > 0:
+            in_cat = sum(1 for c in self._open_categories.values()
+                         if c == category)
+            if in_cat >= max_cat:
+                self._audit("category_concentration", market,
+                            {"category": category, "in_category": in_cat})
+                return
 
-        # Prefer token_id from the first fire that has one.
+        avg_confidence = sum(f.confidence for f in active) / len(active)
         token_id = ""
         for f in active:
             if f.token_id:
                 token_id = f.token_id
                 break
 
+        cid = new_correlation_id()
+        self._open_markets.add(market)
+        if category:
+            self._open_categories[market] = category
+
+        if self._ledger:
+            self._ledger.log_grid_fire(
+                market, direction, len(active), agreement, cid,
+            )
+
         meta = {
             "n_signals": len(active),
             "agreement": agreement,
             "detectors": [f.detector_name for f in active],
+            "category": category or "",
         }
+        self._on_entry(market, token_id, direction, avg_confidence, meta, cid)
 
-        self._open_markets.add(market)
+    # lifecycle -----------------------------------------------------
 
-        if self._ledger:
-            self._ledger.log_grid_fire(market, direction, len(active), agreement)
+    async def mark_closed(self, market: str, pnl_usdc: float) -> None:
+        async with self._lock:
+            self._mark_closed_inner(market, pnl_usdc)
 
-        self._on_entry(market, token_id, direction, avg_confidence, meta)
+    def mark_closed_sync(self, market: str, pnl_usdc: float) -> None:
+        self._mark_closed_inner(market, pnl_usdc)
 
-    # ── position lifecycle hooks ────────────────────────────────────
-
-    def mark_closed(self, market: str, pnl_usdc: float) -> None:
-        """Called when a grid-managed position is exited."""
+    def _mark_closed_inner(self, market: str, pnl_usdc: float) -> None:
         self._open_markets.discard(market)
+        self._open_categories.pop(market, None)
         self._state.get(market).clear()
-
         if pnl_usdc < 0:
             self.daily_loss_usdc += abs(pnl_usdc)
             self.consecutive_losses += 1
         else:
             self.consecutive_losses = 0
 
+    # daily reset ---------------------------------------------------
+
+    def _maybe_daily_reset(self) -> None:
+        today = self._today_utc()
+        if today != self._last_reset_utc_date:
+            self._last_reset_utc_date = today
+            self.daily_loss_usdc = 0.0
+            self.consecutive_losses = 0
+            if self._ledger:
+                self._ledger.log_audit("daily_reset", utc_date=today)
+
+    @staticmethod
+    def _today_utc() -> str:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
     def reset_daily(self) -> None:
         self.daily_loss_usdc = 0.0
         self.consecutive_losses = 0
+        self._last_reset_utc_date = self._today_utc()
+
+    # audit ---------------------------------------------------------
+
+    def _audit(self, reason: str, market: str, meta: Optional[dict] = None) -> None:
+        if self._ledger:
+            self._ledger.log_block(reason, market, meta)

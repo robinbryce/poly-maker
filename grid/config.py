@@ -47,6 +47,16 @@ class GridConfig:
     # Consecutive losing trades before the grid pauses.
     consecutive_loss_cap: int = 5
 
+    # Max open positions in a single category (0 = disabled).
+    max_open_per_category: int = 0
+
+    # P1 hard second-lock for live mode: both mode="live" AND
+    # live_armed=True must hold for orders to actually be placed.
+    live_armed: bool = False
+
+    # Snapshot / state directory for graceful restart.
+    state_dir: str = "state"
+
     # ── detector-specific knobs ─────────────────────────────────────
     # Volume: multiplier over rolling baseline to fire.
     volume_spike_multiplier: float = 3.0

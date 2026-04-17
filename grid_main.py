@@ -41,8 +41,10 @@ print(f"[grid] mode={config.mode}  kill_switch={config.kill_switch}  "
 
 from ledger.store import LedgerStore
 from grid import http_client
+from grid.snapshot import SnapshotStore
 
 ledger = LedgerStore(config.ledger_dir)
+snapshot_store = SnapshotStore(config.state_dir)
 
 # Install the configured rate-limited HTTP session so every feed
 # module's ``http_client.get(...)`` respects the per-host throttles.
@@ -93,13 +95,15 @@ paper_exec = PaperExecutor(config, ledger)
 live_exec = LiveExecutor(config, ledger)
 
 
-def on_entry(market: str, token_id: str, direction: Direction,
-             confidence: float, meta: dict) -> None:
+async def on_entry(market: str, token_id: str, direction: Direction,
+                   confidence: float, meta: dict, correlation_id: str) -> None:
     """Dispatch to the appropriate executor based on mode."""
     if config.mode == "live":
-        live_exec.enter(market, token_id, direction, confidence, meta)
+        live_exec.enter(market, token_id, direction, confidence, meta,
+                        correlation_id)
     else:
-        paper_exec.enter(market, token_id, direction, confidence, meta)
+        await paper_exec.enter(market, token_id, direction, confidence, meta,
+                               correlation_id)
 
 
 # ── coordinator ─────────────────────────────────────────────────────
@@ -107,7 +111,14 @@ def on_entry(market: str, token_id: str, direction: Direction,
 from grid.coordinator import Coordinator
 
 coordinator = Coordinator(config, on_entry, ledger)
-bus.set_fire_callback(coordinator.ingest)
+
+# The event bus fires into a sync callback, so we wrap the async
+# coordinator.ingest in a task-scheduling shim.
+def _bus_fire_callback(fires):
+    loop = asyncio.get_event_loop()
+    asyncio.ensure_future(coordinator.ingest(fires))
+
+bus.set_fire_callback(_bus_fire_callback)
 
 # ── feeds ───────────────────────────────────────────────────────────
 
@@ -247,47 +258,53 @@ async def connect_grid_user_ws() -> None:
 
 # ── periodic background tasks ───────────────────────────────────────
 
-def _background_polling() -> None:
-    """Background thread: polls feeds, checks paper exits, resets daily."""
-    last_daily_reset = time.time()
+async def _periodic_pollers() -> None:
+    """Async task: drives feed polling via to_thread (blocking HTTP
+    stays off the event loop), checks paper exits on the loop so
+    coordinator/paper state is only mutated from asyncio."""
     last_discovery = 0.0
-    DISCOVERY_INTERVAL = 300.0  # 5 minutes
+    DISCOVERY_INTERVAL = 300.0
     while True:
-        time.sleep(10)
+        await asyncio.sleep(10)
         try:
-            # Gamma-based discovery: find new threshold markets and
-            # register them so the grid picks them up on the next
-            # reconnect, without any operator intervention.
             now = time.time()
             if now - last_discovery > DISCOVERY_INTERVAL:
-                gamma_discovery.poll()
+                await asyncio.to_thread(gamma_discovery.poll)
                 last_discovery = now
 
-            # Feed polls.  Category / theta state is fed directly by
-            # gamma_discovery at registration time, so we don't need a
-            # separate gamma metadata poller.
-            oracle_poller.poll()
-            cross_market_poller.poll()
-            whale_poller.poll()
+            await asyncio.to_thread(oracle_poller.poll)
+            await asyncio.to_thread(cross_market_poller.poll)
+            await asyncio.to_thread(whale_poller.poll)
+            await asyncio.to_thread(bus.poll_all)
 
-            # Let polling detectors evaluate
-            bus.poll_all()
-
-            # Paper exit checks
-            closed = paper_exec.check_exits()
+            closed = await paper_exec.check_exits()
             for market, pnl in closed:
-                coordinator.mark_closed(market, pnl)
+                await coordinator.mark_closed(market, pnl)
 
-            # Daily risk reset
-            if time.time() - last_daily_reset > 86400:
-                coordinator.reset_daily()
-                last_daily_reset = time.time()
-                print("[grid] daily risk counters reset")
-
+            # Wall-clock daily reset is handled inside coordinator.ingest
+            # now, not here.
         except Exception:
-            print("[grid] background polling error")
+            print("[grid] periodic poller error")
             traceback.print_exc()
         gc.collect()
+
+
+async def _periodic_snapshot() -> None:
+    """Every 60s write the current grid state to disk so a crash
+    restart resumes correctly."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            _save_snapshot()
+        except Exception:
+            traceback.print_exc()
+
+
+def _save_snapshot() -> None:
+    snapshot_store.save({
+        "coordinator": coordinator.snapshot(),
+        "paper_executor": paper_exec.snapshot(),
+    })
 
 
 # ── main ────────────────────────────────────────────────────────────
@@ -326,21 +343,60 @@ async def main() -> None:
             print("[grid] WARNING: no tokens discovered — the market ws will "
                   "idle until discovery finds a qualifying threshold market.")
 
-    # Start background polling thread.
-    t = threading.Thread(target=_background_polling, daemon=True)
-    t.start()
-
-    # Main loop: maintain websocket connections.
-    while True:
+    # Restore state if a prior run left a snapshot.
+    prior = snapshot_store.load()
+    if prior:
         try:
-            tasks = [connect_grid_market_ws(global_state.all_tokens)]
-            if config.mode == "live":
-                tasks.append(connect_grid_user_ws())
-            await asyncio.gather(*tasks)
+            coordinator.restore(prior.get("coordinator", {}))
+            paper_exec.restore(prior.get("paper_executor", {}))
+            print(f"[grid] restored state from snapshot: "
+                  f"open_markets={len(coordinator._open_markets)} "
+                  f"paper_positions={paper_exec.open_count}")
         except Exception:
+            print("[grid] failed to restore snapshot")
             traceback.print_exc()
-        await asyncio.sleep(1)
-        gc.collect()
+
+    # Install signal handlers to drain on SIGTERM / SIGINT.
+    import signal
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    def _request_shutdown(sig_name):
+        print(f"[grid] received {sig_name}, saving snapshot and exiting")
+        try:
+            _save_snapshot()
+            ledger.log_audit("shutdown", signal=sig_name)
+        finally:
+            stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, sig.name)
+        except NotImplementedError:
+            # Windows or some restricted envs.
+            pass
+
+    # Async background tasks.
+    poll_task = asyncio.create_task(_periodic_pollers())
+    snap_task = asyncio.create_task(_periodic_snapshot())
+
+    async def ws_loop():
+        while not stop_event.is_set():
+            try:
+                tasks = [connect_grid_market_ws(global_state.all_tokens)]
+                if config.mode == "live":
+                    tasks.append(connect_grid_user_ws())
+                await asyncio.gather(*tasks)
+            except Exception:
+                traceback.print_exc()
+            await asyncio.sleep(1)
+
+    ws_task = asyncio.create_task(ws_loop())
+    await stop_event.wait()
+    for t in (poll_task, snap_task, ws_task):
+        t.cancel()
+    # Final flush.
+    _save_snapshot()
 
 
 if __name__ == "__main__":

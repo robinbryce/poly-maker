@@ -41,8 +41,8 @@ class TestPaperExecutorIsolation:
 
         cfg = GridConfig(max_entry_usdc=10.0)
         paper = PaperExecutor(cfg, LedgerStore(str(tmp_path)))
-        paper.enter("mkt1", "tok1", Direction.BUY, 0.9,
-                    {"detectors": ["a", "b", "c"]})
+        paper.enter_sync("mkt1", "tok1", Direction.BUY, 0.9,
+                         {"detectors": ["a", "b", "c"]}, "cid123")
 
         sentinel.create_order.assert_not_called()
         sentinel.cancel_all_asset.assert_not_called()
@@ -75,7 +75,7 @@ class TestLiveExecutorGating:
 
         cfg = GridConfig(mode="paper", max_entry_usdc=10.0)
         live = LiveExecutor(cfg, LedgerStore(str(tmp_path)))
-        live.enter("mkt1", "tok1", Direction.BUY, 0.9, {})
+        live.enter("mkt1", "tok1", Direction.BUY, 0.9, {}, "cid")
 
         gs.client.create_order.assert_not_called()
         assert "mode is not" in capsys.readouterr().out
@@ -87,9 +87,10 @@ class TestLiveExecutorGating:
         gs.client = MagicMock()
         gs.all_data = {"mkt1": {"bids": {0.5: 100}, "asks": {0.51: 100}}}
 
-        cfg = GridConfig(mode="live", kill_switch=True, max_entry_usdc=10.0)
+        cfg = GridConfig(mode="live", kill_switch=True,
+                         live_armed=True, max_entry_usdc=10.0)
         live = LiveExecutor(cfg, LedgerStore(str(tmp_path)))
-        live.enter("mkt1", "tok1", Direction.BUY, 0.9, {})
+        live.enter("mkt1", "tok1", Direction.BUY, 0.9, {}, "cid")
 
         gs.client.create_order.assert_not_called()
         assert "kill switch" in capsys.readouterr().out
@@ -110,7 +111,7 @@ class TestCoordinatorGuardrails:
         entries = []
         cfg = GridConfig(min_signals=3, kill_switch=True)
         coord = Coordinator(cfg, lambda *a: entries.append(a))
-        coord.ingest(_fires("mkt1"))
+        coord.ingest_sync(_fires("mkt1"))
         assert entries == []
 
     def test_max_open_positions_blocks_additional_markets(self):
@@ -118,11 +119,11 @@ class TestCoordinatorGuardrails:
         cfg = GridConfig(min_signals=3, max_open_positions=2)
         coord = Coordinator(cfg, lambda *a: entries.append(a))
 
-        coord.ingest(_fires("mkt1"))
-        coord.ingest(_fires("mkt2"))
+        coord.ingest_sync(_fires("mkt1"))
+        coord.ingest_sync(_fires("mkt2"))
         assert len(entries) == 2
 
-        coord.ingest(_fires("mkt3"))
+        coord.ingest_sync(_fires("mkt3"))
         assert len(entries) == 2
 
     def test_consecutive_loss_cap_blocks_entries(self):
@@ -131,12 +132,12 @@ class TestCoordinatorGuardrails:
                          daily_loss_cap_usdc=1e9)
         coord = Coordinator(cfg, lambda *a: entries.append(a))
 
-        coord.ingest(_fires("mkt1"))
-        coord.mark_closed("mkt1", -1.0)
-        coord.ingest(_fires("mkt2"))
-        coord.mark_closed("mkt2", -1.0)
+        coord.ingest_sync(_fires("mkt1"))
+        coord.mark_closed_sync("mkt1", -1.0)
+        coord.ingest_sync(_fires("mkt2"))
+        coord.mark_closed_sync("mkt2", -1.0)
 
-        coord.ingest(_fires("mkt3"))
+        coord.ingest_sync(_fires("mkt3"))
         assert len(entries) == 2
 
     def test_winning_trade_resets_consecutive_loss_count(self):
@@ -145,22 +146,22 @@ class TestCoordinatorGuardrails:
                          daily_loss_cap_usdc=1e9)
         coord = Coordinator(cfg, lambda *a: entries.append(a))
 
-        coord.ingest(_fires("mkt1"))
-        coord.mark_closed("mkt1", -1.0)
-        coord.ingest(_fires("mkt2"))
-        coord.mark_closed("mkt2", +2.0)
+        coord.ingest_sync(_fires("mkt1"))
+        coord.mark_closed_sync("mkt1", -1.0)
+        coord.ingest_sync(_fires("mkt2"))
+        coord.mark_closed_sync("mkt2", +2.0)
 
-        coord.ingest(_fires("mkt3"))
-        coord.mark_closed("mkt3", -1.0)
-        coord.ingest(_fires("mkt4"))
+        coord.ingest_sync(_fires("mkt3"))
+        coord.mark_closed_sync("mkt3", -1.0)
+        coord.ingest_sync(_fires("mkt4"))
         assert len(entries) == 4
 
     def test_reset_daily_clears_counters(self):
         cfg = GridConfig(min_signals=3, daily_loss_cap_usdc=10.0)
         coord = Coordinator(cfg, lambda *a: None)
 
-        coord.ingest(_fires("mkt1"))
-        coord.mark_closed("mkt1", -50.0)
+        coord.ingest_sync(_fires("mkt1"))
+        coord.mark_closed_sync("mkt1", -50.0)
         assert coord.daily_loss_usdc >= 50.0
         assert coord.consecutive_losses >= 1
 
@@ -194,7 +195,7 @@ class TestStaleness:
         coord = Coordinator(cfg, lambda *a: entries.append(a))
 
         now = time.time()
-        coord.ingest([
+        coord.ingest_sync([
             SignalFire("volume",      "mkt1", "tok", Direction.BUY, 0.9, now),
             SignalFire("velocity",    "mkt1", "tok", Direction.BUY, 0.9, now - 120),
             SignalFire("disposition", "mkt1", "tok", Direction.BUY, 0.9, now - 120),
