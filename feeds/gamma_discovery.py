@@ -30,7 +30,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional
 
-import requests
+from grid import http_client
 
 import poly_data.global_state as global_state
 
@@ -132,7 +132,7 @@ class GammaDiscoveryPoller:
 
         for term in self._search_terms:
             try:
-                resp = requests.get(
+                resp = http_client.get(
                     f"{GAMMA_BASE}/public-search",
                     params={"q": f"{term} above", "limit": 40},
                     timeout=15,

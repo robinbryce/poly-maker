@@ -40,8 +40,16 @@ print(f"[grid] mode={config.mode}  kill_switch={config.kill_switch}  "
 # ── infrastructure ──────────────────────────────────────────────────
 
 from ledger.store import LedgerStore
+from grid import http_client
 
 ledger = LedgerStore(config.ledger_dir)
+
+# Install the configured rate-limited HTTP session so every feed
+# module's ``http_client.get(...)`` respects the per-host throttles.
+http_client.configure(config.http_throttle)
+print(f"[grid] http_throttle configured for "
+      f"{len([h for h in config.http_throttle if h != 'default'])} hosts "
+      f"(plus default)")
 
 # ── detectors ───────────────────────────────────────────────────────
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict
 
-import requests
+from grid import http_client
 
 if TYPE_CHECKING:
     from detectors.news import NewsDetector
@@ -46,7 +46,7 @@ class OraclePoller:
     def _poll_coingecko(self, ids_to_market: Dict[str, str]) -> None:
         ids_csv = ",".join(ids_to_market.keys())
         try:
-            resp = requests.get(
+            resp = http_client.get(
                 COINGECKO_SIMPLE,
                 params={"ids": ids_csv, "vs_currencies": "usd"},
                 timeout=10,

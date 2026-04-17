@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Dict, Set
 
-import requests
+from grid import http_client
 
 if TYPE_CHECKING:
     from detectors.whale import WhaleDetector
@@ -37,7 +37,7 @@ class WhalePoller:
 
         for wallet in self.config.whale_wallets:
             try:
-                resp = requests.get(
+                resp = http_client.get(
                     f"{DATA_API}/activity",
                     params={"user": wallet},
                     timeout=10,

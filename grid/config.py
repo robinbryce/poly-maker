@@ -89,6 +89,38 @@ class GridConfig:
     # ── ledger ──────────────────────────────────────────────────────
     ledger_dir: str = "ledger_data"
 
+    # ── HTTP throttling (see grid/http_client.py) ───────────────────
+    # Mapping of host -> ThrottleConfig fields.  The reserved "default"
+    # key supplies the fallback for any unlisted host.  Sensible
+    # defaults are baked in so paper mode works out of the box.
+    http_throttle: Dict[str, dict] = field(default_factory=lambda: {
+        "default": {
+            "min_interval_secs": 1.0,
+            "max_retries": 4,
+            "backoff_base": 1.0,
+            "backoff_max": 60.0,
+            "jitter": 0.25,
+        },
+        "api.coingecko.com": {
+            # CoinGecko free tier caps at ~20 req/min.  If a penalty-
+            # box kicks in we cool the host down for 5 min so the
+            # oracle poll loop stays responsive.
+            "min_interval_secs": 3.5,
+            "max_retries": 3,
+            "backoff_base": 2.0,
+            "backoff_max": 60.0,
+            "cooldown_on_final_429_secs": 300.0,
+        },
+        "gamma-api.polymarket.com": {
+            "min_interval_secs": 1.0,
+            "max_retries": 4,
+        },
+        "data-api.polymarket.com": {
+            "min_interval_secs": 1.0,
+            "max_retries": 4,
+        },
+    })
+
     # ── factory helpers ─────────────────────────────────────────────
     @classmethod
     def from_json(cls, path: str) -> "GridConfig":

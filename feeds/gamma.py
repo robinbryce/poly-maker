@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List
 
-import requests
+from grid import http_client
 
 if TYPE_CHECKING:
     from detectors.category import CategoryDetector
@@ -37,7 +37,7 @@ class GammaPoller:
 
     def poll(self) -> None:
         try:
-            resp = requests.get(
+            resp = http_client.get(
                 f"{GAMMA_BASE}/markets",
                 params={"limit": 100, "active": "true"},
                 timeout=15,

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict
 
-import requests
+from grid import http_client
 
 if TYPE_CHECKING:
     from detectors.cross_market import CrossMarketDetector
@@ -32,7 +32,7 @@ class CrossMarketPoller:
             if not url:
                 continue
             try:
-                resp = requests.get(url, timeout=10)
+                resp = http_client.get(url, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
                 value = self._extract(data, json_path)
