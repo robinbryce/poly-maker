@@ -5,6 +5,8 @@ credentials.json
 .env
 .env.*
 positions/
+ledger_data/
+grid_config.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
