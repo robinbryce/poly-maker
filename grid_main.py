@@ -261,6 +261,11 @@ def _background_polling() -> None:
                 gamma_discovery.poll()
                 last_discovery = now
 
+            # Keep the gamma_poller's tracked-markets list in sync with
+            # whatever gamma_discovery has registered, so the category
+            # and theta detectors get metadata for those markets.
+            gamma_poller._tracked = gamma_discovery.all_tracked_cids()
+
             # Feed polls
             gamma_poller.poll()
             oracle_poller.poll()

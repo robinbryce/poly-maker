@@ -72,6 +72,15 @@ class GammaDiscoveryPoller:
     Designed to run on the shared background-polling interval.  All
     HTTP and parse failures are swallowed with a log message so that
     transient Gamma outages can't take the grid down.
+
+    Two discovery paths:
+
+    *  Threshold markets ("Will the price of X be above $Y on <date>?"):
+       registered with the oracle poller so the news detector can
+       compare feed vs market midpoint.
+    *  Top-volume markets: registered only for websocket subscription
+       so the volume / disposition / whale detectors have something
+       with actual trade flow to observe.
     """
 
     def __init__(
@@ -82,6 +91,9 @@ class GammaDiscoveryPoller:
         lookahead_hours: float = 48.0,
         min_volume_usdc: float = 10_000.0,
         margin: float = 0.01,
+        top_volume_count: int = 30,
+        top_volume_min_usdc: float = 100_000.0,
+        top_volume_lookahead_days: float = 14.0,
     ):
         self._oracle = oracle_poller
         self._news_det = news_detector
@@ -92,8 +104,16 @@ class GammaDiscoveryPoller:
         self._min_volume = min_volume_usdc
         self._margin = margin
 
+        # Top-volume discovery knobs.
+        self._top_volume_count = top_volume_count
+        self._top_volume_min_usdc = top_volume_min_usdc
+        self._top_volume_lookahead_days = top_volume_lookahead_days
+
         # condition_id -> {end_epoch, token_ids, question, coin_id, threshold}
         self._registered: Dict[str, dict] = {}
+        # condition_id -> {end_epoch, token_ids, question, volume} for
+        # markets tracked for subscription but without oracle mapping.
+        self._tracked_only: Dict[str, dict] = {}
 
         # Set whenever we append new token ids to global_state.all_tokens.
         # The asyncio layer polls this and forces a websocket reconnect
@@ -105,16 +125,28 @@ class GammaDiscoveryPoller:
     def poll(self) -> None:
         """One discovery cycle.  Intended to be called from the shared
         background polling loop."""
-        discovered = self._discover()
         added_any_tokens = False
-        for entry in discovered:
+
+        # 1. Threshold markets (register with oracle + subscribe).
+        for entry in self._discover_threshold():
             if self._register(entry):
+                added_any_tokens = True
+
+        # 2. Top-volume markets (subscribe only).
+        for entry in self._discover_top_volume():
+            if self._track_only(entry):
                 added_any_tokens = True
 
         if added_any_tokens:
             self.subscription_dirty.set()
 
         self._evict_expired()
+
+    def all_tracked_cids(self) -> List[str]:
+        """Every condition_id this poller currently considers tracked
+        (threshold + top-volume).  Fed into the main gamma_poller so
+        the category and theta detectors receive metadata for them."""
+        return list(self._registered.keys()) + list(self._tracked_only.keys())
 
     def snapshot(self) -> List[dict]:
         """Return a copy of the current registrations for logging."""
@@ -123,9 +155,9 @@ class GammaDiscoveryPoller:
             for cid, meta in self._registered.items()
         ]
 
-    # ── discovery ───────────────────────────────────────────────────
+    # ── discovery ────────────────────────────────────────────────────────
 
-    def _discover(self) -> List[dict]:
+    def _discover_threshold(self) -> List[dict]:
         out: List[dict] = []
         now = time.time()
         horizon = now + self._lookahead_hours * 3600
@@ -156,6 +188,75 @@ class GammaDiscoveryPoller:
                     if parsed["volume"] < self._min_volume:
                         continue
                     out.append(parsed)
+        return out
+
+    def _discover_top_volume(self) -> List[dict]:
+        """Fetch the highest-volume active markets from Gamma.  These
+        are registered for subscription only — no oracle mapping.
+        """
+        try:
+            resp = http_client.get(
+                f"{GAMMA_BASE}/markets",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "order": "volumeNum",
+                    "ascending": "false",
+                    "limit": self._top_volume_count,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            markets = resp.json()
+        except Exception as exc:
+            print(f"[gamma_discovery] top-volume poll failed: {exc}")
+            return []
+
+        now = time.time()
+        horizon = now + self._top_volume_lookahead_days * 86400
+
+        out: List[dict] = []
+        for m in markets or []:
+            cid = m.get("conditionId") or ""
+            if not cid:
+                continue
+            # Skip if already covered by threshold discovery.
+            if cid in self._registered:
+                continue
+
+            end_iso = m.get("endDate") or ""
+            try:
+                end_dt = datetime.datetime.fromisoformat(
+                    end_iso.replace("Z", "+00:00"))
+                end_epoch = end_dt.timestamp()
+            except Exception:
+                continue
+            if end_epoch <= now or end_epoch > horizon:
+                continue
+
+            volume = 0.0
+            for key in ("volumeNum", "volume"):
+                v = m.get(key)
+                if v is not None:
+                    try:
+                        volume = float(v)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            if volume < self._top_volume_min_usdc:
+                continue
+
+            token_ids = self._extract_token_ids(m)
+            if not token_ids:
+                continue
+
+            out.append({
+                "condition_id": cid,
+                "end_epoch":    end_epoch,
+                "token_ids":    token_ids,
+                "question":     m.get("question") or "",
+                "volume":       volume,
+            })
         return out
 
     def _parse_market(self, m: dict) -> Optional[dict]:
@@ -278,25 +379,59 @@ class GammaDiscoveryPoller:
         )
         return added > 0
 
+    def _track_only(self, entry: dict) -> bool:
+        """Register a market for subscription without an oracle
+        mapping.  Returns True if any new token ids were added."""
+        cid = entry["condition_id"]
+        if cid in self._tracked_only or cid in self._registered:
+            return False
+
+        added = 0
+        for tid in entry["token_ids"]:
+            if tid and tid not in global_state.all_tokens:
+                global_state.all_tokens.append(tid)
+                added += 1
+
+        self._tracked_only[cid] = {
+            "end_epoch": entry["end_epoch"],
+            "token_ids": entry["token_ids"],
+            "question":  entry["question"],
+            "volume":    entry["volume"],
+        }
+        print(
+            f"[gamma_discovery] +track  vol={entry['volume']:>12,.0f}  "
+            f"new_tokens={added}  cid={cid[:12]}…  q={entry['question'][:60]}"
+        )
+        return added > 0
+
     def _evict_expired(self) -> None:
         now = time.time()
+        # Threshold / oracle-backed markets.
         expired = [
             cid for cid, meta in self._registered.items()
             if meta["end_epoch"] <= now
         ]
         for cid in expired:
             meta = self._registered.pop(cid)
-            # Drop the oracle + news-detector state for this market.
             self._oracle._mappings.pop(cid, None)
             try:
                 self._news_det._feed_values.pop(cid, None)
                 self._news_det._midpoints.pop(cid, None)
             except AttributeError:
                 pass
-            # Intentionally leave token_ids in global_state.all_tokens:
-            # removing them mid-run would complicate the ws reconnect
-            # logic and the same ids can reappear in follow-up markets.
             print(
                 f"[gamma_discovery] -expire {meta['coin_id']} > "
                 f"${meta['threshold']:,.0f}  cid={cid[:12]}…"
+            )
+
+        # Top-volume markets (no oracle state to drop).
+        expired = [
+            cid for cid, meta in self._tracked_only.items()
+            if meta["end_epoch"] <= now
+        ]
+        for cid in expired:
+            meta = self._tracked_only.pop(cid)
+            print(
+                f"[gamma_discovery] -expire top-volume  "
+                f"vol={meta['volume']:,.0f}  cid={cid[:12]}…"
             )
