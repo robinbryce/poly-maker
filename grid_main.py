@@ -111,7 +111,6 @@ bus.set_fire_callback(coordinator.ingest)
 
 # ── feeds ───────────────────────────────────────────────────────────
 
-from feeds.gamma import GammaPoller
 from feeds.gamma_discovery import GammaDiscoveryPoller
 from feeds.oracle import OraclePoller
 from feeds.cross_market import CrossMarketPoller
@@ -121,12 +120,13 @@ from feeds.whale import WhalePoller
 # the initial data load.
 import poly_data.global_state as global_state
 
-gamma_poller = GammaPoller([], category_det, theta_det)
 oracle_poller = OraclePoller(config, news_det)
 cross_market_poller = CrossMarketPoller(config, cross_market_det)
 whale_poller = WhalePoller(config, whale_det)
 gamma_discovery = GammaDiscoveryPoller(
-    oracle_poller, news_det, theta_detector=theta_det,
+    oracle_poller, news_det,
+    theta_detector=theta_det,
+    category_detector=category_det,
 )
 
 # Register any oracle mappings declared in the config file so the news
@@ -263,13 +263,9 @@ def _background_polling() -> None:
                 gamma_discovery.poll()
                 last_discovery = now
 
-            # Keep the gamma_poller's tracked-markets list in sync with
-            # whatever gamma_discovery has registered, so the category
-            # and theta detectors get metadata for those markets.
-            gamma_poller._tracked = gamma_discovery.all_tracked_cids()
-
-            # Feed polls
-            gamma_poller.poll()
+            # Feed polls.  Category / theta state is fed directly by
+            # gamma_discovery at registration time, so we don't need a
+            # separate gamma metadata poller.
             oracle_poller.poll()
             cross_market_poller.poll()
             whale_poller.poll()
@@ -310,7 +306,6 @@ async def main() -> None:
         tracked = []
         if global_state.df is not None:
             tracked = global_state.df["condition_id"].tolist()
-        gamma_poller._tracked = tracked
         print(f"[grid] live mode: {len(global_state.all_tokens)} tokens, "
               f"{len(tracked)} tracked markets")
     else:

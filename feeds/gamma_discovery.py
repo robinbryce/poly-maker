@@ -35,6 +35,7 @@ from grid import http_client
 import poly_data.global_state as global_state
 
 if TYPE_CHECKING:
+    from detectors.category import CategoryDetector
     from detectors.news import NewsDetector
     from detectors.theta import ThetaDetector
     from feeds.oracle import OraclePoller
@@ -96,10 +97,16 @@ class GammaDiscoveryPoller:
         top_volume_min_usdc: float = 100_000.0,
         top_volume_lookahead_days: float = 14.0,
         theta_detector: "ThetaDetector | None" = None,
+        category_detector: "CategoryDetector | None" = None,
+        category_baseline_samples: int = 20,
     ):
         self._oracle = oracle_poller
         self._news_det = news_detector
         self._theta_det = theta_detector
+        self._cat_det = category_detector
+        self._category_samples = category_baseline_samples
+        # category -> list[float] of recent per-poll volume totals
+        self._category_history: Dict[str, List[float]] = {}
         self._search_terms = search_terms or [
             "bitcoin", "ethereum", "solana",
         ]
@@ -196,6 +203,9 @@ class GammaDiscoveryPoller:
     def _discover_top_volume(self) -> List[dict]:
         """Fetch the highest-volume active markets from Gamma.  These
         are registered for subscription only — no oracle mapping.
+
+        Also uses the full response to feed category statistics into
+        the category detector.
         """
         try:
             resp = http_client.get(
@@ -218,11 +228,31 @@ class GammaDiscoveryPoller:
         now = time.time()
         horizon = now + self._top_volume_lookahead_days * 86400
 
+        # Per-category totals this cycle (used to update baselines).
+        per_category: Dict[str, float] = {}
+
         out: List[dict] = []
         for m in markets or []:
             cid = m.get("conditionId") or ""
             if not cid:
                 continue
+
+            volume = 0.0
+            for key in ("volumeNum", "volume"):
+                v = m.get(key)
+                if v is not None:
+                    try:
+                        volume = float(v)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+
+            # Aggregate for category stats regardless of whether we'll
+            # subscribe to this market.
+            cat = m.get("category")
+            if cat:
+                per_category[cat] = per_category.get(cat, 0.0) + volume
+
             # Skip if already covered by threshold discovery.
             if cid in self._registered:
                 continue
@@ -237,15 +267,6 @@ class GammaDiscoveryPoller:
             if end_epoch <= now or end_epoch > horizon:
                 continue
 
-            volume = 0.0
-            for key in ("volumeNum", "volume"):
-                v = m.get(key)
-                if v is not None:
-                    try:
-                        volume = float(v)
-                        break
-                    except (TypeError, ValueError):
-                        continue
             if volume < self._top_volume_min_usdc:
                 continue
 
@@ -259,8 +280,23 @@ class GammaDiscoveryPoller:
                 "token_ids":    token_ids,
                 "question":     m.get("question") or "",
                 "volume":       volume,
+                "category":     cat or "",
             })
+
+        # Roll forward category baselines and publish stats.
+        self._update_category_stats(per_category)
         return out
+
+    def _update_category_stats(self, per_category: Dict[str, float]) -> None:
+        if self._cat_det is None:
+            return
+        for cat, vol in per_category.items():
+            hist = self._category_history.setdefault(cat, [])
+            hist.append(vol)
+            if len(hist) > self._category_samples:
+                hist.pop(0)
+            baseline = sum(hist) / len(hist)
+            self._cat_det.set_category_stats(cat, vol, baseline)
 
     def _parse_market(self, m: dict) -> Optional[dict]:
         cid = m.get("conditionId") or ""
@@ -396,6 +432,11 @@ class GammaDiscoveryPoller:
         # Feed the theta detector directly (same rationale as in _register).
         if self._theta_det is not None:
             self._theta_det.set_end_date(cid, entry["end_epoch"])
+        # If this market came in via the /markets endpoint we also have
+        # its category — link it to the category detector so category-
+        # level regime signals can fire on this cid.
+        if self._cat_det is not None and entry.get("category"):
+            self._cat_det.set_market_category(cid, entry["category"])
 
         added = 0
         for tid in entry["token_ids"]:
@@ -408,6 +449,7 @@ class GammaDiscoveryPoller:
             "token_ids": entry["token_ids"],
             "question":  entry["question"],
             "volume":    entry["volume"],
+            "category":  entry.get("category", ""),
         }
         print(
             f"[gamma_discovery] +track  vol={entry['volume']:>12,.0f}  "
