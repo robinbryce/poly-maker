@@ -131,9 +131,15 @@ if config.oracle_mappings:
 
 import websockets
 
-from poly_data.polymarket_client import PolymarketClient
-from poly_data.data_utils import update_markets, update_positions, update_orders
 from poly_data.data_processing import process_data, process_user_data
+# Live mode (mode="live") requires the authenticated client + sheet
+# bootstrap.  Paper mode uses a credential-free public client.
+if config.mode == "live":
+    from poly_data.polymarket_client import PolymarketClient
+    from poly_data.data_utils import (
+        update_markets, update_positions, update_orders,
+    )
+from poly_data.public_client import PublicPolymarketClient
 
 
 def _enrich_event(json_data: dict) -> dict:
@@ -276,21 +282,39 @@ def _background_polling() -> None:
 # ── main ────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    # Initialise the Polymarket client and load initial state.
-    global_state.client = PolymarketClient()
     global_state.all_tokens = []
-    update_markets()
-    update_positions()
-    update_orders()
 
-    # Populate tracked markets for the gamma poller.
-    tracked = []
-    if global_state.df is not None:
-        tracked = global_state.df["condition_id"].tolist()
-    gamma_poller._tracked = tracked
+    if config.mode == "live":
+        # Live mode: needs the authenticated client, sheet-driven markets,
+        # and the user websocket for fill tracking.
+        global_state.client = PolymarketClient()
+        update_markets()
+        update_positions()
+        update_orders()
 
-    print(f"[grid] {len(global_state.all_tokens)} tokens, "
-          f"{len(tracked)} tracked markets")
+        tracked = []
+        if global_state.df is not None:
+            tracked = global_state.df["condition_id"].tolist()
+        gamma_poller._tracked = tracked
+        print(f"[grid] live mode: {len(global_state.all_tokens)} tokens, "
+              f"{len(tracked)} tracked markets")
+    else:
+        # Paper mode: no PK, no sheet.  Seed the token list with a
+        # blocking discovery pass so the market ws has something to
+        # subscribe to on first connect.
+        global_state.client = PublicPolymarketClient()
+        print("[grid] paper mode: no credentials required, "
+              "bootstrapping via gamma discovery…")
+        gamma_discovery.poll()
+        # The ws hasn't started yet, so the dirty flag set by the
+        # bootstrap discovery would trigger a pointless reconnect on
+        # first tick — clear it now.
+        gamma_discovery.subscription_dirty.clear()
+        print(f"[grid] paper mode: seeded {len(global_state.all_tokens)} tokens "
+              f"from gamma_discovery")
+        if not global_state.all_tokens:
+            print("[grid] WARNING: no tokens discovered — the market ws will "
+                  "idle until discovery finds a qualifying threshold market.")
 
     # Start background polling thread.
     t = threading.Thread(target=_background_polling, daemon=True)
@@ -299,10 +323,10 @@ async def main() -> None:
     # Main loop: maintain websocket connections.
     while True:
         try:
-            await asyncio.gather(
-                connect_grid_market_ws(global_state.all_tokens),
-                connect_grid_user_ws(),
-            )
+            tasks = [connect_grid_market_ws(global_state.all_tokens)]
+            if config.mode == "live":
+                tasks.append(connect_grid_user_ws())
+            await asyncio.gather(*tasks)
         except Exception:
             traceback.print_exc()
         await asyncio.sleep(1)
