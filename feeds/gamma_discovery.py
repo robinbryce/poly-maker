@@ -36,6 +36,7 @@ import poly_data.global_state as global_state
 
 if TYPE_CHECKING:
     from detectors.news import NewsDetector
+    from detectors.theta import ThetaDetector
     from feeds.oracle import OraclePoller
 
 
@@ -94,9 +95,11 @@ class GammaDiscoveryPoller:
         top_volume_count: int = 30,
         top_volume_min_usdc: float = 100_000.0,
         top_volume_lookahead_days: float = 14.0,
+        theta_detector: "ThetaDetector | None" = None,
     ):
         self._oracle = oracle_poller
         self._news_det = news_detector
+        self._theta_det = theta_detector
         self._search_terms = search_terms or [
             "bitcoin", "ethereum", "solana",
         ]
@@ -352,6 +355,10 @@ class GammaDiscoveryPoller:
             threshold=entry["threshold"],
             margin=self._margin,
         )
+        # Feed the theta detector directly; gamma_poller's top-100
+        # /markets page often doesn't include our tracked cids.
+        if self._theta_det is not None:
+            self._theta_det.set_end_date(cid, entry["end_epoch"])
 
         added = 0
         for tid in entry["token_ids"]:
@@ -385,6 +392,10 @@ class GammaDiscoveryPoller:
         cid = entry["condition_id"]
         if cid in self._tracked_only or cid in self._registered:
             return False
+
+        # Feed the theta detector directly (same rationale as in _register).
+        if self._theta_det is not None:
+            self._theta_det.set_end_date(cid, entry["end_epoch"])
 
         added = 0
         for tid in entry["token_ids"]:

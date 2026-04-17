@@ -125,7 +125,9 @@ gamma_poller = GammaPoller([], category_det, theta_det)
 oracle_poller = OraclePoller(config, news_det)
 cross_market_poller = CrossMarketPoller(config, cross_market_det)
 whale_poller = WhalePoller(config, whale_det)
-gamma_discovery = GammaDiscoveryPoller(oracle_poller, news_det)
+gamma_discovery = GammaDiscoveryPoller(
+    oracle_poller, news_det, theta_detector=theta_det,
+)
 
 # Register any oracle mappings declared in the config file so the news
 # detector has something to compare market midpoints against.
