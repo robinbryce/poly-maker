@@ -59,13 +59,25 @@ class OraclePoller:
 
         for coin_id, market in ids_to_market.items():
             price = data.get(coin_id, {}).get("usd")
-            if price is not None:
-                # Normalise to 0–1 probability if the mapping provides a threshold.
-                mapping = self._mappings[market]
-                threshold = mapping.get("threshold")
-                if threshold is not None:
-                    # e.g. "BTC above 100k" → value = price / threshold, clamped 0–1
-                    value = min(max(float(price) / float(threshold), 0.0), 1.0)
+            if price is None:
+                continue
+            mapping = self._mappings[market]
+            threshold = mapping.get("threshold")
+            margin = float(mapping.get("margin", 0.01))  # 1% default dead-zone
+            if threshold is not None:
+                # Threshold-style markets ("BTC above $X on day Y"): treat
+                # the feed as binary with a margin so we don't emit a
+                # signal when price is hovering around the threshold.
+                t = float(threshold)
+                p = float(price)
+                if p > t * (1 + margin):
+                    value = 1.0
+                elif p < t * (1 - margin):
+                    value = 0.0
                 else:
-                    value = float(price)  # raw — caller must interpret
-                self._news_det.set_feed_value(market, value, f"coingecko:{coin_id}")
+                    # Within margin — skip updating so news detector
+                    # doesn't produce a spurious fire near the boundary.
+                    continue
+            else:
+                value = float(price)  # raw — caller must interpret
+            self._news_det.set_feed_value(market, value, f"coingecko:{coin_id}")

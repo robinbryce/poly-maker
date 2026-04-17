@@ -76,6 +76,11 @@ class GridConfig:
     #   { "condition_abc": {"source": "coingecko", "pair": "bitcoin"} }
     cross_market_refs: Dict[str, dict] = field(default_factory=dict)
 
+    # ── oracle mappings for the news detector ───────────────────────
+    # Maps a Polymarket condition_id to an oracle source descriptor:
+    #   { "0x<cid>": {"source": "coingecko", "id": "bitcoin", "threshold": 62000} }
+    oracle_mappings: Dict[str, dict] = field(default_factory=dict)
+
     # ── feed poll intervals (seconds) ───────────────────────────────
     gamma_poll_interval: float = 60.0
     oracle_poll_interval: float = 30.0
