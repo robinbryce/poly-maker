@@ -398,6 +398,19 @@ async def main() -> None:
             print(f"[grid] restored state from snapshot: "
                   f"open_markets={len(coordinator._open_markets)} "
                   f"paper_positions={paper_exec.open_count}")
+            # P1.1 completion: the coordinator's open_markets is a
+            # derived index; the source of truth for paper mode is
+            # the paper executor's positions map.  Evict any markets
+            # tracked by the coordinator that have no matching
+            # position — those are legacy orphans from the pre-P1.1
+            # entry path that lost them on a silent executor decline.
+            if config.mode != "live":
+                evicted = await coordinator.reconcile_open_markets(
+                    paper_exec.open_markets()
+                )
+                if evicted:
+                    print(f"[grid] reconcile evicted {evicted} orphan "
+                          f"market(s) from coordinator state")
         except Exception:
             print("[grid] failed to restore snapshot")
             traceback.print_exc()

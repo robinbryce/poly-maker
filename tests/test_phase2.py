@@ -196,10 +196,21 @@ def _live_cfg(book_drift_bps=100.0):
 
 
 def _audit_reasons(path):
+    """Return a flat list of every audit tag: both ``reason`` (from
+    ``log_block``) and ``event`` (from ``log_audit``)."""
     if not os.path.exists(path):
         return []
+    tags = []
     with open(path) as f:
-        return [json.loads(l).get("reason") for l in f if l.strip()]
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec.get("reason") is not None:
+                tags.append(rec["reason"])
+            if rec.get("event") is not None:
+                tags.append(rec["event"])
+    return tags
 
 
 class TestLiveDriftGuard:
@@ -289,3 +300,34 @@ class TestLiveDriftGuard:
         gs.client.create_order.assert_not_called()
         reasons = _audit_reasons(tmp_path / "audit_log.jsonl")
         assert "no_asks" in reasons
+
+
+# --------------------------------------------------------------------
+# orphan reconcile after snapshot restore
+# --------------------------------------------------------------------
+
+class TestOrphanReconcile:
+    def test_reconcile_evicts_markets_without_positions(self, tmp_path):
+        led = LedgerStore(str(tmp_path))
+        cfg = GridConfig(min_signals=3, daily_loss_cap_usdc=1e9)
+        coord = Coordinator(cfg, lambda *a: None, ledger=led)
+        # Simulate a stale snapshot where the coordinator tracked
+        # five markets as open but the paper executor lost the
+        # positions on a silent pre-P1.1 decline.
+        coord.restore({"open_markets": ["m1", "m2", "m3", "m4", "m5"]})
+        assert len(coord.open_markets) == 5
+
+        evicted = coord.reconcile_open_markets_sync(actually_open=set())
+        assert evicted == 5
+        assert coord.open_markets == set()
+        reasons = _audit_reasons(tmp_path / "audit_log.jsonl")
+        assert "orphan_evicted" in reasons
+
+    def test_reconcile_preserves_matching_markets(self, tmp_path):
+        led = LedgerStore(str(tmp_path))
+        cfg = GridConfig(min_signals=3, daily_loss_cap_usdc=1e9)
+        coord = Coordinator(cfg, lambda *a: None, ledger=led)
+        coord.restore({"open_markets": ["m1", "m2", "m3"]})
+        evicted = coord.reconcile_open_markets_sync({"m1", "m3"})
+        assert evicted == 1
+        assert coord.open_markets == {"m1", "m3"}
