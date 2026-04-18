@@ -56,13 +56,42 @@ class LiveExecutor:
         if direction == Direction.BUY:
             asks = book.get("asks")
             if not asks:
+                print(f"[live] no asks for {market}")
+                self._ledger.log_block("no_asks", market)
                 return
             price = float(min(asks.keys()))
         else:
             bids = book.get("bids")
             if not bids:
+                print(f"[live] no bids for {market}")
+                self._ledger.log_block("no_bids", market)
                 return
             price = float(max(bids.keys()))
+
+        # Pre-trade book-drift guard: refuse if the book has moved
+        # more than book_drift_bps since the fire moment.
+        fire_price = meta.get("fire_price") if isinstance(meta, dict) else None
+        drift_limit = float(getattr(self.config, "book_drift_bps", 0.0) or 0.0)
+        if fire_price and drift_limit > 0:
+            try:
+                fp = float(fire_price)
+            except (TypeError, ValueError):
+                fp = 0.0
+            if fp > 0:
+                drift_bps = abs(price - fp) / fp * 10_000.0
+                if drift_bps > drift_limit:
+                    print(f"[live] book drift {drift_bps:.1f}bps > "
+                          f"{drift_limit:.1f}bps for {market[:12]}… "
+                          f"refusing order")
+                    self._ledger.log_block(
+                        "book_drift_exceeded", market,
+                        {"drift_bps": drift_bps,
+                         "limit_bps": drift_limit,
+                         "fire_price": fp,
+                         "price_now": price,
+                         "correlation_id": correlation_id},
+                    )
+                    return
 
         size = min(self.config.max_entry_usdc / price, self.config.max_entry_usdc)
         resp = client.create_order(token_id, action, price, size, neg_risk=False)

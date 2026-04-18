@@ -6,6 +6,8 @@ credentials.json
 .env.*
 positions/
 ledger_data/
+ledger_data.pre_*/
+state/
 grid_config.json
 
 # Byte-compiled / optimized / DLL files

@@ -27,12 +27,14 @@ class Coordinator:
         on_entry,  # (market, token_id, direction, confidence, meta, correlation_id)
         ledger: Optional["LedgerStore"] = None,
         category_of: Optional[Callable[[str], Optional[str]]] = None,
+        get_midpoint: Optional[Callable[[str], Optional[float]]] = None,
     ):
         self.config = config
         self._state = GridState(config.signal_staleness_secs)
         self._on_entry = on_entry
         self._ledger = ledger
         self._category_of = category_of or (lambda _m: None)
+        self._get_midpoint = get_midpoint or (lambda _m: None)
 
         self._open_markets: Set[str] = set()
         self._open_categories: Dict[str, str] = {}
@@ -67,12 +69,19 @@ class Coordinator:
 
     async def ingest(self, fires: List[SignalFire]) -> None:
         async with self._lock:
-            self._ingest_inner(fires)
+            self._maybe_daily_reset()
+            for fire in fires:
+                self._state.get(fire.market).update(fire)
+                if self._ledger:
+                    self._ledger.log_signal_fire(fire)
+            seen: set = set()
+            for fire in fires:
+                if fire.market in seen:
+                    continue
+                seen.add(fire.market)
+                await self._evaluate(fire.market)
 
     def ingest_sync(self, fires: List[SignalFire]) -> None:
-        self._ingest_inner(fires)
-
-    def _ingest_inner(self, fires: List[SignalFire]) -> None:
         self._maybe_daily_reset()
         for fire in fires:
             self._state.get(fire.market).update(fire)
@@ -83,40 +92,72 @@ class Coordinator:
             if fire.market in seen:
                 continue
             seen.add(fire.market)
-            self._evaluate(fire.market)
+            self._evaluate_sync(fire.market)
 
     # evaluate ------------------------------------------------------
 
-    def _evaluate(self, market: str) -> None:
+    async def _evaluate(self, market: str) -> None:
+        d = self._decide(market)
+        if d is None:
+            return
+        direction, _, active, token_id, cid, category, avg_conf, meta, \
+            agreement = d
+        if self._ledger:
+            self._ledger.log_grid_fire(
+                market, direction, len(active), agreement, cid,
+            )
+        result = self._on_entry(
+            market, token_id, direction, avg_conf, meta, cid,
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+        self._commit_or_decline(market, category, cid, result)
+
+    def _evaluate_sync(self, market: str) -> None:
+        d = self._decide(market)
+        if d is None:
+            return
+        direction, _, active, token_id, cid, category, avg_conf, meta, \
+            agreement = d
+        if self._ledger:
+            self._ledger.log_grid_fire(
+                market, direction, len(active), agreement, cid,
+            )
+        result = self._on_entry(
+            market, token_id, direction, avg_conf, meta, cid,
+        )
+        self._commit_or_decline(market, category, cid, result)
+
+    def _decide(self, market: str):
         if self.config.kill_switch:
             self._audit("kill_switch", market)
-            return
+            return None
         if market in self._open_markets:
             self._audit("already_open", market)
-            return
+            return None
         if len(self._open_markets) >= self.config.max_open_positions:
             self._audit("max_open_positions", market,
                         {"limit": self.config.max_open_positions})
-            return
+            return None
         if self.daily_loss_usdc >= self.config.daily_loss_cap_usdc:
             self._audit("daily_loss_cap", market,
                         {"loss_usdc": self.daily_loss_usdc})
-            return
+            return None
         if self.consecutive_losses >= self.config.consecutive_loss_cap:
             self._audit("consecutive_loss_cap", market,
                         {"losses": self.consecutive_losses})
-            return
+            return None
 
         ms = self._state.get(market)
         active = ms.active_signals()
         if len(active) < self.config.min_signals:
-            return
+            return None
 
         direction, agreement = ms.dominant_direction()
         if direction is None or agreement < self.config.direction_threshold:
             self._audit("direction_threshold", market,
                         {"agreement": agreement})
-            return
+            return None
 
         category = self._category_of(market)
         max_cat = getattr(self.config, "max_open_per_category", 0)
@@ -126,7 +167,7 @@ class Coordinator:
             if in_cat >= max_cat:
                 self._audit("category_concentration", market,
                             {"category": category, "in_category": in_cat})
-                return
+                return None
 
         avg_confidence = sum(f.confidence for f in active) / len(active)
         token_id = ""
@@ -134,24 +175,45 @@ class Coordinator:
             if f.token_id:
                 token_id = f.token_id
                 break
-
         cid = new_correlation_id()
-        self._open_markets.add(market)
-        if category:
-            self._open_categories[market] = category
-
-        if self._ledger:
-            self._ledger.log_grid_fire(
-                market, direction, len(active), agreement, cid,
-            )
-
         meta = {
             "n_signals": len(active),
             "agreement": agreement,
             "detectors": [f.detector_name for f in active],
             "category": category or "",
         }
-        self._on_entry(market, token_id, direction, avg_confidence, meta, cid)
+        # Capture the midpoint at fire time so the live executor can
+        # detect drift between the fire moment and the order moment.
+        fire_price = self._get_midpoint(market)
+        if fire_price is not None:
+            meta["fire_price"] = float(fire_price)
+        return (direction, agreement, active, token_id, cid, category,
+                avg_confidence, meta, agreement)
+
+    def _commit_or_decline(self, market, category, cid, result) -> None:
+        """Commit market to _open_markets only if the executor returned
+        success.  If it declined, audit-log the reason and do not track
+        the market as open."""
+        ok = True
+        reason = None
+        meta = None
+        if result is None:
+            # Tests that use a no-op lambda as on_entry return None;
+            # treat that as success.
+            ok = True
+        elif hasattr(result, "ok"):
+            ok = bool(result.ok)
+            reason = getattr(result, "reason", None)
+            meta = getattr(result, "meta", None)
+
+        if ok:
+            self._open_markets.add(market)
+            if category:
+                self._open_categories[market] = category
+        else:
+            self._audit("executor_declined", market,
+                        {"reason": reason, "correlation_id": cid,
+                         "meta": meta})
 
     # lifecycle -----------------------------------------------------
 
@@ -191,6 +253,30 @@ class Coordinator:
         self.daily_loss_usdc = 0.0
         self.consecutive_losses = 0
         self._last_reset_utc_date = self._today_utc()
+
+    # reconciliation ------------------------------------------------
+
+    async def reconcile_open_markets(self, actually_open) -> int:
+        async with self._lock:
+            return self._reconcile_inner(actually_open)
+
+    def reconcile_open_markets_sync(self, actually_open) -> int:
+        return self._reconcile_inner(actually_open)
+
+    def _reconcile_inner(self, actually_open) -> int:
+        actual = set(actually_open)
+        orphans = [m for m in list(self._open_markets) if m not in actual]
+        for m in orphans:
+            self._open_markets.discard(m)
+            self._open_categories.pop(m, None)
+            self._state.get(m).clear()
+            if self._ledger:
+                self._ledger.log_audit("orphan_evicted", market=m)
+        return len(orphans)
+
+    @property
+    def open_markets(self) -> set:
+        return set(self._open_markets)
 
     # audit ---------------------------------------------------------
 

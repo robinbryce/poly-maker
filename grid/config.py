@@ -1,17 +1,73 @@
 """
 Grid configuration.
 
-Loadable from environment variables or a JSON file.  Every field has a
-safe default so the grid can start in paper / read-only mode without
-any external config.
+Loadable from environment variables or a JSON file.  Every field has
+a safe default so the grid can start in paper / read-only mode
+without any external config.
+
+P2 split
+--------
+The fields on ``GridConfig`` come in two flavours:
+
+* **Deployment** fields (``DEPLOYMENT_FIELDS``) — mode, directories,
+  HTTP throttling, oracle / whale / cross-market feed setup, poll
+  intervals.  Changing any of these requires a process restart.
+  ``validate_for_deployment()`` asserts that the deployment fields
+  are coherent (e.g. live mode has a ``PK`` set).
+
+* **Runtime** fields (``RUNTIME_FIELDS``) — detector thresholds, risk
+  caps, book drift guard.  These can be reloaded on ``SIGHUP`` via
+  ``reload_runtime_from(path)`` without dropping open positions or
+  resetting daily counters.
+
+``GridConfig`` stays flat so all existing call sites keep working;
+``DeploymentConfig`` and ``RuntimeConfig`` are lightweight views that
+expose only the relevant subset of fields for inspection or audit.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List
+from dataclasses import dataclass, field, fields
+from typing import Any, ClassVar, Dict, FrozenSet, List, Set
+
+
+@dataclass(frozen=True)
+class DeploymentConfig:
+    """Immutable view of the deployment-level config slice."""
+    mode: str
+    kill_switch: bool
+    live_armed: bool
+    state_dir: str
+    ledger_dir: str
+    whale_wallets: List[str]
+    cross_market_refs: Dict[str, dict]
+    oracle_mappings: Dict[str, dict]
+    gamma_poll_interval: float
+    oracle_poll_interval: float
+    whale_poll_interval: float
+    http_throttle: Dict[str, dict]
+
+
+@dataclass
+class RuntimeConfig:
+    """Reloadable view of the runtime-level config slice."""
+    min_signals: int
+    signal_staleness_secs: float
+    direction_threshold: float
+    max_entry_usdc: float
+    max_open_positions: int
+    daily_loss_cap_usdc: float
+    consecutive_loss_cap: int
+    max_open_per_category: int
+    volume_spike_multiplier: float
+    velocity_threshold: float
+    disposition_threshold: float
+    cross_market_delta_cents: float
+    news_delta_cents: float
+    theta_hours: float
+    book_drift_bps: float
 
 
 @dataclass
@@ -76,6 +132,11 @@ class GridConfig:
     # Theta: hours-before-resolution pressure window.
     theta_hours: float = 48.0
 
+    # Live pre-trade book-drift guard.  Refuse the order when the
+    # book has moved more than this many basis points (1 bp = 0.01%)
+    # since the fire moment.  Default 100 bps = 1%.
+    book_drift_bps: float = 100.0
+
     # ── whale detector ──────────────────────────────────────────────
     # Full wallet addresses to watch.  Empty until the operator
     # supplies them — the whale detector is a no-op until then.
@@ -130,6 +191,94 @@ class GridConfig:
             "max_retries": 4,
         },
     })
+
+    # ── deployment / runtime split (P2) ─────────────────────────────
+    # Fields that describe *where* and *how* the process is running.
+    # Changing any of these requires a full restart.
+    DEPLOYMENT_FIELDS: ClassVar[FrozenSet[str]] = frozenset({
+        "mode", "kill_switch", "live_armed", "state_dir", "ledger_dir",
+        "whale_wallets", "cross_market_refs", "oracle_mappings",
+        "gamma_poll_interval", "oracle_poll_interval",
+        "whale_poll_interval", "http_throttle",
+    })
+
+    # Fields that can be live-reloaded via SIGHUP.  Every non-
+    # deployment field belongs here by construction (see the self-
+    # check in ``__post_init__``).
+    RUNTIME_FIELDS: ClassVar[FrozenSet[str]] = frozenset({
+        "min_signals", "signal_staleness_secs", "direction_threshold",
+        "max_entry_usdc", "max_open_positions", "daily_loss_cap_usdc",
+        "consecutive_loss_cap", "max_open_per_category",
+        "volume_spike_multiplier", "velocity_threshold",
+        "disposition_threshold", "cross_market_delta_cents",
+        "news_delta_cents", "theta_hours", "book_drift_bps",
+    })
+
+    def __post_init__(self) -> None:
+        all_declared = {f.name for f in fields(self)}
+        covered = self.DEPLOYMENT_FIELDS | self.RUNTIME_FIELDS
+        missing = all_declared - covered
+        if missing:
+            raise RuntimeError(
+                f"GridConfig fields missing from deployment/runtime "
+                f"split: {sorted(missing)}"
+            )
+
+    # ── typed views ─────────────────────────────────────────────────
+    def deployment(self) -> DeploymentConfig:
+        return DeploymentConfig(**{
+            k: getattr(self, k) for k in self.DEPLOYMENT_FIELDS
+        })
+
+    def runtime(self) -> RuntimeConfig:
+        return RuntimeConfig(**{
+            k: getattr(self, k) for k in self.RUNTIME_FIELDS
+        })
+
+    # ── validation ──────────────────────────────────────────────────
+    def validate_for_deployment(self) -> None:
+        """Fail fast if the deployment config is inconsistent.
+
+        Paper mode is always accepted.  Live mode requires both the
+        ``live_armed`` flag and a ``PK`` environment variable.  This
+        is the startup-time guard; ``LiveExecutor.enter`` re-checks at
+        order-placement time too.
+        """
+        if self.mode not in ("paper", "live"):
+            raise ValueError(
+                f"mode must be 'paper' or 'live', got {self.mode!r}"
+            )
+        if self.mode == "live":
+            if not self.live_armed:
+                raise ValueError(
+                    "live mode requires live_armed=true in the config "
+                    "(second lock)"
+                )
+            if not os.environ.get("PK"):
+                raise ValueError(
+                    "live mode requires the PK environment variable "
+                    "to be set"
+                )
+
+    # ── runtime reload (SIGHUP) ─────────────────────────────────────
+    def reload_runtime_from(self, path: str) -> Set[str]:
+        """Reload runtime-only fields from ``path``.
+
+        Deployment fields in the file are ignored so a SIGHUP can
+        never silently change mode / credentials / state dirs while
+        the process is live.  Returns the set of field names that
+        actually changed.
+        """
+        with open(path) as f:
+            raw = json.load(f)
+        changed: Set[str] = set()
+        for key, value in raw.items():
+            if key not in self.RUNTIME_FIELDS:
+                continue
+            if getattr(self, key) != value:
+                setattr(self, key, value)
+                changed.add(key)
+        return changed
 
     # ── factory helpers ─────────────────────────────────────────────
     @classmethod

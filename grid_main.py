@@ -34,8 +34,12 @@ else:
     config = GridConfig.from_env()
     print("[grid] loaded config from environment (defaults where unset)")
 
+# P2: fail fast if the deployment slice is inconsistent (e.g. live
+# mode without PK / live_armed).  Paper mode is always accepted.
+config.validate_for_deployment()
+
 print(f"[grid] mode={config.mode}  kill_switch={config.kill_switch}  "
-      f"min_signals={config.min_signals}")
+      f"live_armed={config.live_armed}  min_signals={config.min_signals}")
 
 # ── infrastructure ──────────────────────────────────────────────────
 
@@ -110,13 +114,53 @@ async def on_entry(market: str, token_id: str, direction: Direction,
 
 from grid.coordinator import Coordinator
 
-coordinator = Coordinator(config, on_entry, ledger)
 
-# The event bus fires into a sync callback, so we wrap the async
-# coordinator.ingest in a task-scheduling shim.
+def _get_midpoint(market: str):
+    """Return the current book midpoint for ``market`` or None.
+
+    Used by the coordinator to stamp ``fire_price`` into entry meta
+    so the live executor can enforce a pre-trade drift guard.
+    """
+    book = global_state.all_data.get(market) if hasattr(
+        global_state, "all_data"
+    ) else None
+    if not book:
+        return None
+    bids = book.get("bids")
+    asks = book.get("asks")
+    if not bids or not asks:
+        return None
+    try:
+        return (float(max(bids.keys())) + float(min(asks.keys()))) / 2.0
+    except (TypeError, ValueError):
+        return None
+
+
+coordinator = Coordinator(
+    config, on_entry, ledger, get_midpoint=_get_midpoint,
+)
+
+# The event bus fires into a sync callback that may be invoked from
+# either the asyncio event loop (ws dispatch) or a worker thread
+# (poll_all via asyncio.to_thread).  We capture the main loop at
+# startup so the callback can schedule coordinator.ingest() safely
+# from either context.
+from typing import Optional as _Optional
+_main_loop: _Optional[asyncio.AbstractEventLoop] = None
+
 def _bus_fire_callback(fires):
-    loop = asyncio.get_event_loop()
-    asyncio.ensure_future(coordinator.ingest(fires))
+    loop = _main_loop
+    if loop is None:
+        return
+    coro = coordinator.ingest(fires)
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        asyncio.ensure_future(coro, loop=loop)
+    else:
+        asyncio.run_coroutine_threadsafe(coro, loop)
 
 bus.set_fire_callback(_bus_fire_callback)
 
@@ -310,6 +354,8 @@ def _save_snapshot() -> None:
 # ── main ────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
     global_state.all_tokens = []
 
     if config.mode == "live":
@@ -369,12 +415,43 @@ async def main() -> None:
         finally:
             stop_event.set()
 
+    def _reload_runtime_config():
+        """SIGHUP handler: reload only the runtime slice of the config.
+
+        Deployment fields (mode, dirs, throttling, feed setup) are
+        intentionally ignored so a hot reload can't silently change
+        where state lives or arm live mode behind the operator's back.
+        """
+        try:
+            if not os.path.isfile(_cfg_path):
+                print(f"[grid] SIGHUP: {_cfg_path} not found, ignoring")
+                return
+            changed = config.reload_runtime_from(_cfg_path)
+            if changed:
+                print(f"[grid] SIGHUP: runtime config reloaded, "
+                      f"changed fields: {sorted(changed)}")
+            else:
+                print("[grid] SIGHUP: no runtime fields changed")
+            ledger.log_audit(
+                "runtime_reload",
+                path=_cfg_path,
+                changed=sorted(changed),
+            )
+        except Exception as exc:
+            print(f"[grid] SIGHUP: runtime reload failed: {exc}")
+            traceback.print_exc()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _request_shutdown, sig.name)
         except NotImplementedError:
             # Windows or some restricted envs.
             pass
+    try:
+        loop.add_signal_handler(signal.SIGHUP, _reload_runtime_config)
+    except (NotImplementedError, AttributeError):
+        # Windows has no SIGHUP.
+        pass
 
     # Async background tasks.
     poll_task = asyncio.create_task(_periodic_pollers())
