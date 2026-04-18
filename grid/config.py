@@ -68,6 +68,11 @@ class RuntimeConfig:
     news_delta_cents: float
     theta_hours: float
     book_drift_bps: float
+    max_slippage_bps: float
+    exit_tp_cents: float
+    exit_sl_cents: float
+    exit_tighten_hours: float
+    exit_tighten_factor: float
 
 
 @dataclass
@@ -136,6 +141,25 @@ class GridConfig:
     # book has moved more than this many basis points (1 bp = 0.01%)
     # since the fire moment.  Default 100 bps = 1%.
     book_drift_bps: float = 100.0
+
+    # P3: maximum tolerable slippage when walking the book on a
+    # paper-mode entry.  If the VWAP of the simulated fill sits
+    # further than this many bps from the best price the paper
+    # executor refuses the entry with reason slippage_exceeded.
+    max_slippage_bps: float = 50.0
+
+    # P3: cent-based take-profit / stop-loss thresholds, used by the
+    # default CentThresholdStrategy.  These are absolute cent moves
+    # from the entry price, so they behave consistently across a
+    # mid=0.05 market and a mid=0.50 market.
+    exit_tp_cents: float = 3.0
+    exit_sl_cents: float = 2.0
+
+    # P3: when the market is within this many hours of resolution,
+    # tighten the TP/SL thresholds by exit_tighten_factor so the
+    # strategy banks PnL faster near resolution.
+    exit_tighten_hours: float = 1.0
+    exit_tighten_factor: float = 0.5
 
     # ── whale detector ──────────────────────────────────────────────
     # Full wallet addresses to watch.  Empty until the operator
@@ -212,6 +236,8 @@ class GridConfig:
         "volume_spike_multiplier", "velocity_threshold",
         "disposition_threshold", "cross_market_delta_cents",
         "news_delta_cents", "theta_hours", "book_drift_bps",
+        "max_slippage_bps", "exit_tp_cents", "exit_sl_cents",
+        "exit_tighten_hours", "exit_tighten_factor",
     })
 
     def __post_init__(self) -> None:

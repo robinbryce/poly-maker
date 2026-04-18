@@ -94,8 +94,27 @@ bus = EventBus(all_detectors)
 from detectors.base import Direction
 from executor.paper import PaperExecutor
 from executor.live import LiveExecutor
+from executor.exit_strategy import CentThresholdStrategy
 
-paper_exec = PaperExecutor(config, ledger)
+
+def _hours_to_resolution(market: str):
+    """Return hours-to-resolution for ``market`` or ``None``.
+
+    Backed by the theta detector's end-date index, which
+    gamma_discovery populates for every tracked market.
+    """
+    import time
+    end_epoch = theta_det._end_dates.get(market)
+    if end_epoch is None:
+        return None
+    return max(0.0, (end_epoch - time.time()) / 3600.0)
+
+
+paper_exec = PaperExecutor(
+    config, ledger,
+    exit_strategy=CentThresholdStrategy(config),
+    hours_to_resolution=_hours_to_resolution,
+)
 live_exec = LiveExecutor(config, ledger)
 
 
@@ -137,7 +156,9 @@ def _get_midpoint(market: str):
 
 
 coordinator = Coordinator(
-    config, on_entry, ledger, get_midpoint=_get_midpoint,
+    config, on_entry, ledger,
+    get_midpoint=_get_midpoint,
+    category_of=category_det.category_of,
 )
 
 # The event bus fires into a sync callback that may be invoked from

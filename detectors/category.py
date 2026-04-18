@@ -33,6 +33,15 @@ class CategoryDetector(BaseDetector):
     def set_market_category(self, market: str, category: str) -> None:
         self._market_category[market] = category
 
+    def category_of(self, market: str) -> Optional[str]:
+        """Return the Gamma category for ``market``, or ``None``.
+
+        Used by the coordinator to enforce
+        ``max_open_per_category``.  Gamma-discovery populates this
+        map from the ``/markets`` response.
+        """
+        return self._market_category.get(market)
+
     def set_category_stats(
         self, category: str, recent_volume: float, baseline_volume: float
     ) -> None:
