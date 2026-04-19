@@ -24,18 +24,22 @@ P3:
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from detectors.base import Direction
 from executor.book_walker import FillResult, walk_book
 from executor.exit_strategy import CentThresholdStrategy, ExitStrategy
+from grid.metrics import counters
 
 if TYPE_CHECKING:
     from grid.config import GridConfig
     from ledger.store import LedgerStore
 
 import poly_data.global_state as global_state
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -100,7 +104,11 @@ class PaperExecutor:
 
         book = global_state.all_data.get(market)
         if not book:
-            print(f"[paper] no book for {market}, skipping entry")
+            logger.info(
+                "no book for %s, skipping entry", market[:12],
+                extra={"market": market, "correlation_id": correlation_id},
+            )
+            counters.labelled_incr("paper.entries", {"outcome": "no_book"})
             self._ledger.log_block("no_book", market,
                                    {"correlation_id": correlation_id})
             return ExecutionResult.declined("no_book")
@@ -130,8 +138,19 @@ class PaperExecutor:
 
         slip_limit = float(self.config.max_slippage_bps)
         if slip_limit > 0 and fill.slippage_bps > slip_limit:
-            print(f"[paper] slippage {fill.slippage_bps:.1f}bps > "
-                  f"{slip_limit:.1f}bps for {market[:12]}… refusing")
+            logger.warning(
+                "slippage %.1fbps > %.1fbps for %s, refusing",
+                fill.slippage_bps, slip_limit, market[:12],
+                extra={
+                    "market": market,
+                    "slippage_bps": fill.slippage_bps,
+                    "limit_bps": slip_limit,
+                    "correlation_id": correlation_id,
+                },
+            )
+            counters.labelled_incr(
+                "paper.entries", {"outcome": "slippage_exceeded"},
+            )
             self._ledger.log_block(
                 "slippage_exceeded", market,
                 {"slippage_bps": fill.slippage_bps,
@@ -159,9 +178,20 @@ class PaperExecutor:
             if fp > 0:
                 drift_bps = abs(fill.vwap - fp) / fp * 10_000.0
                 if drift_bps > drift_limit:
-                    print(f"[paper] book drift {drift_bps:.1f}bps > "
-                          f"{drift_limit:.1f}bps for {market[:12]}… "
-                          f"refusing")
+                    logger.warning(
+                        "book drift %.1fbps > %.1fbps for %s, refusing",
+                        drift_bps, drift_limit, market[:12],
+                        extra={
+                            "market": market,
+                            "drift_bps": drift_bps,
+                            "limit_bps": drift_limit,
+                            "correlation_id": correlation_id,
+                        },
+                    )
+                    counters.labelled_incr(
+                        "paper.entries",
+                        {"outcome": "book_drift_exceeded"},
+                    )
                     self._ledger.log_block(
                         "book_drift_exceeded", market,
                         {"drift_bps": drift_bps,
@@ -202,11 +232,23 @@ class PaperExecutor:
             market, token_id, direction.value, filled_size, vwap, "paper",
             fill_meta, correlation_id,
         )
-        print(f"[paper] ENTER {direction.value} {market[:12]}… "
-              f"size={filled_size:.2f} vwap={vwap:.4f} "
-              f"slip={fill.slippage_bps:.1f}bps "
-              f"signals={fill_meta.get('detectors')} "
-              f"cid={correlation_id[:8]}…")
+        logger.info(
+            "ENTER %s %s… size=%.2f vwap=%.4f slip=%.1fbps signals=%s cid=%s…",
+            direction.value, market[:12], filled_size, vwap,
+            fill.slippage_bps, fill_meta.get("detectors"),
+            correlation_id[:8],
+            extra={
+                "event": "paper_enter",
+                "market": market,
+                "direction": direction.value,
+                "size": filled_size,
+                "vwap": vwap,
+                "slippage_bps": fill.slippage_bps,
+                "detectors": fill_meta.get("detectors"),
+                "correlation_id": correlation_id,
+            },
+        )
+        counters.labelled_incr("paper.entries", {"outcome": "ok"})
         return ExecutionResult.success(
             price=vwap, size=filled_size,
             slippage_bps=fill.slippage_bps,
@@ -245,9 +287,21 @@ class PaperExecutor:
                 decision.pnl_usdc, "paper", pos["correlation_id"],
             )
             tag = decision.reason.upper()
-            print(f"[paper] EXIT {tag} {market[:12]}… "
-                  f"pnl={decision.pnl_usdc:.2f} USDC "
-                  f"cid={pos['correlation_id'][:8]}…")
+            logger.info(
+                "EXIT %s %s… pnl=%.2f USDC cid=%s…",
+                tag, market[:12], decision.pnl_usdc,
+                pos["correlation_id"][:8],
+                extra={
+                    "event": "paper_exit",
+                    "market": market,
+                    "reason": decision.reason,
+                    "pnl_usdc": decision.pnl_usdc,
+                    "correlation_id": pos["correlation_id"],
+                },
+            )
+            counters.labelled_incr(
+                "paper.exits", {"outcome": decision.reason},
+            )
             del self._positions[market]
             closed.append((market, decision.pnl_usdc))
         return closed

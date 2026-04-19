@@ -41,6 +41,8 @@ class DeploymentConfig:
     live_armed: bool
     state_dir: str
     ledger_dir: str
+    log_dir: str
+    log_level: str
     whale_wallets: List[str]
     cross_market_refs: Dict[str, dict]
     oracle_mappings: Dict[str, dict]
@@ -200,8 +202,12 @@ class GridConfig:
     oracle_poll_interval: float = 30.0
     whale_poll_interval: float = 30.0
 
-    # ── ledger ──────────────────────────────────────────────────────
+    # ── ledger ─────────────────────────────────────────────────────
     ledger_dir: str = "ledger_data"
+
+    # ── logging (P5) ─────────────────────────────────────────────
+    log_dir: str = "logs"
+    log_level: str = "INFO"
 
     # ── HTTP throttling (see grid/http_client.py) ───────────────────
     # Mapping of host -> ThrottleConfig fields.  The reserved "default"
@@ -240,6 +246,7 @@ class GridConfig:
     # Changing any of these requires a full restart.
     DEPLOYMENT_FIELDS: ClassVar[FrozenSet[str]] = frozenset({
         "mode", "kill_switch", "live_armed", "state_dir", "ledger_dir",
+        "log_dir", "log_level",
         "whale_wallets", "cross_market_refs", "oracle_mappings",
         "gamma_poll_interval", "oracle_poll_interval",
         "whale_poll_interval", "http_throttle",

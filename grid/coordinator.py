@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set
 
 from detectors.base import Direction, SignalFire
 from grid.config import GridConfig
+from grid.metrics import counters
 from grid.state import GridState
 from ledger.store import new_correlation_id
 
@@ -111,6 +112,9 @@ class Coordinator:
             self._maybe_daily_reset()
             for fire in fires:
                 self.fires_by_detector[fire.detector_name] += 1
+                counters.labelled_incr(
+                    "grid.fires", {"detector": fire.detector_name}
+                )
                 self._state.get(fire.market).update(fire)
                 if self._ledger:
                     self._ledger.log_signal_fire(fire)
@@ -125,6 +129,9 @@ class Coordinator:
         self._maybe_daily_reset()
         for fire in fires:
             self.fires_by_detector[fire.detector_name] += 1
+            counters.labelled_incr(
+                "grid.fires", {"detector": fire.detector_name}
+            )
             self._state.get(fire.market).update(fire)
             if self._ledger:
                 self._ledger.log_signal_fire(fire)
@@ -143,6 +150,7 @@ class Coordinator:
             return
         direction, _, active, token_id, cid, category, avg_conf, meta, \
             agreement = d
+        counters.incr("grid.grid_fires")
         if self._ledger:
             self._ledger.log_grid_fire(
                 market, direction, len(active), agreement, cid,
@@ -160,6 +168,7 @@ class Coordinator:
             return
         direction, _, active, token_id, cid, category, avg_conf, meta, \
             agreement = d
+        counters.incr("grid.grid_fires")
         if self._ledger:
             self._ledger.log_grid_fire(
                 market, direction, len(active), agreement, cid,
@@ -326,5 +335,6 @@ class Coordinator:
     # audit ---------------------------------------------------------
 
     def _audit(self, reason: str, market: str, meta: Optional[dict] = None) -> None:
+        counters.labelled_incr("grid.blocks", {"reason": reason})
         if self._ledger:
             self._ledger.log_block(reason, market, meta)

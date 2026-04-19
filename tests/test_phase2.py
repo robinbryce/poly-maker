@@ -214,7 +214,7 @@ def _audit_reasons(path):
 
 
 class TestLiveDriftGuard:
-    def test_refuses_when_drift_exceeds_limit(self, tmp_path, capsys):
+    def test_refuses_when_drift_exceeds_limit(self, tmp_path, caplog):
         import poly_data.global_state as gs
 
         gs.client = MagicMock()
@@ -229,15 +229,16 @@ class TestLiveDriftGuard:
         led = LedgerStore(str(tmp_path))
         live = LiveExecutor(cfg, led)
 
-        live.enter(
-            "mkt1", "tok1", Direction.BUY, 0.9,
-            {"fire_price": 0.50}, "cid-drift",
-        )
+        with caplog.at_level("WARNING", logger="executor.live"):
+            live.enter(
+                "mkt1", "tok1", Direction.BUY, 0.9,
+                {"fire_price": 0.50}, "cid-drift",
+            )
 
         gs.client.create_order.assert_not_called()
         reasons = _audit_reasons(tmp_path / "audit_log.jsonl")
         assert "book_drift_exceeded" in reasons
-        assert "book drift" in capsys.readouterr().out
+        assert any("book drift" in r.getMessage() for r in caplog.records)
 
     def test_allows_when_drift_within_limit(self, tmp_path):
         import poly_data.global_state as gs

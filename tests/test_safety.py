@@ -66,7 +66,7 @@ class TestPublicClientBlocksWrites:
 # live-mode gating --------------------------------------------------
 
 class TestLiveExecutorGating:
-    def test_refuses_when_mode_is_paper(self, tmp_path, capsys):
+    def test_refuses_when_mode_is_paper(self, tmp_path, caplog):
         import poly_data.global_state as gs
         from ledger.store import LedgerStore
 
@@ -75,12 +75,13 @@ class TestLiveExecutorGating:
 
         cfg = GridConfig(mode="paper", max_entry_usdc=10.0)
         live = LiveExecutor(cfg, LedgerStore(str(tmp_path)))
-        live.enter("mkt1", "tok1", Direction.BUY, 0.9, {}, "cid")
+        with caplog.at_level("WARNING", logger="executor.live"):
+            live.enter("mkt1", "tok1", Direction.BUY, 0.9, {}, "cid")
 
         gs.client.create_order.assert_not_called()
-        assert "mode is not" in capsys.readouterr().out
+        assert any("mode is not" in r.getMessage() for r in caplog.records)
 
-    def test_refuses_when_kill_switch_on(self, tmp_path, capsys):
+    def test_refuses_when_kill_switch_on(self, tmp_path, caplog):
         import poly_data.global_state as gs
         from ledger.store import LedgerStore
 
@@ -90,10 +91,11 @@ class TestLiveExecutorGating:
         cfg = GridConfig(mode="live", kill_switch=True,
                          live_armed=True, max_entry_usdc=10.0)
         live = LiveExecutor(cfg, LedgerStore(str(tmp_path)))
-        live.enter("mkt1", "tok1", Direction.BUY, 0.9, {}, "cid")
+        with caplog.at_level("WARNING", logger="executor.live"):
+            live.enter("mkt1", "tok1", Direction.BUY, 0.9, {}, "cid")
 
         gs.client.create_order.assert_not_called()
-        assert "kill switch" in capsys.readouterr().out
+        assert any("kill switch" in r.getMessage() for r in caplog.records)
 
 
 # coordinator guardrails --------------------------------------------

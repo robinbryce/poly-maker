@@ -1,0 +1,162 @@
+---
+# Grid lifecycle tasks for the eight-word detector grid.
+#
+# These replace the ad-hoc tmux invocations we were typing out during
+# earlier phases and give the operator one place to look for the run
+# loop, ledger tailing, and report generation.
+#
+# Conventions (per the forest-1 taskfiles):
+#   * Every cmd starts with `set -euo pipefail`.
+#   * Long-running tasks (`run-paper`, `monitor`) detach via tmux.
+
+version: "3"
+
+vars:
+  SESSION: "grid"
+  ROOT:
+    sh: pwd
+  LOGDIR: "{{.ROOT}}/logs"
+  LEDGER: "{{.ROOT}}/ledger_data"
+
+tasks:
+  # ---------------------------------------------------------------
+  # Paper / live lifecycle
+  # ---------------------------------------------------------------
+  run-paper:
+    desc: launch the grid in paper mode inside a 3-window tmux session
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          mkdir -p "{{.LOGDIR}}"
+          LOG="{{.LOGDIR}}/grid-$(date -u +%Y%m%dT%H%M%SZ).log"
+          ln -sfn "${LOG}" "{{.LOGDIR}}/grid-latest.log"
+          if tmux has-session -t {{.SESSION}} 2>/dev/null; then
+            echo "tmux session '{{.SESSION}}' already exists; use 'task grid:stop' first" >&2
+            exit 1
+          fi
+          tmux new-session -d -s {{.SESSION}} -c "{{.ROOT}}" -x 220 -y 50 \
+            "PYTHONUNBUFFERED=1 uv run python -u grid_main.py 2>&1 | tee -a ${LOG}"
+          tmux new-window -t {{.SESSION}} -n ledger -c "{{.ROOT}}" \
+            "tail -F {{.LEDGER}}/grid_fires.jsonl {{.LEDGER}}/entries.jsonl {{.LEDGER}}/exits.jsonl {{.LEDGER}}/audit_log.jsonl"
+          tmux new-window -t {{.SESSION}} -n log -c "{{.ROOT}}" \
+            "tail -F {{.LOGDIR}}/grid-latest.log"
+          tmux select-window -t {{.SESSION}}:0
+          echo "paper grid started, attach with: tmux attach -t {{.SESSION}}"
+          echo "log: ${LOG}"
+
+  run-live:
+    desc: launch the grid in live mode (requires PK and GRID_LIVE_ARMED=1)
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          if [ -z "${PK:-}" ]; then
+            echo "PK environment variable must be set for live mode" >&2
+            exit 1
+          fi
+          if [ "${GRID_LIVE_ARMED:-0}" != "1" ]; then
+            echo "refusing to start live mode without GRID_LIVE_ARMED=1" >&2
+            exit 1
+          fi
+          mkdir -p "{{.LOGDIR}}"
+          LOG="{{.LOGDIR}}/grid-live-$(date -u +%Y%m%dT%H%M%SZ).log"
+          ln -sfn "${LOG}" "{{.LOGDIR}}/grid-latest.log"
+          if tmux has-session -t {{.SESSION}} 2>/dev/null; then
+            echo "tmux session '{{.SESSION}}' already exists; use 'task grid:stop' first" >&2
+            exit 1
+          fi
+          tmux new-session -d -s {{.SESSION}} -c "{{.ROOT}}" -x 220 -y 50 \
+            "GRID_MODE=live PYTHONUNBUFFERED=1 uv run python -u grid_main.py 2>&1 | tee -a ${LOG}"
+          echo "live grid started, attach with: tmux attach -t {{.SESSION}}"
+          echo "log: ${LOG}"
+
+  stop:
+    desc: TERM the grid process (and its monitor), force-kill after grace
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          pkill -TERM -f 'python.*grid_main.py' 2>/dev/null || true
+          pkill -TERM -f 'scripts/monitor.py' 2>/dev/null || true
+          sleep 4
+          pkill -KILL -f 'python.*grid_main.py' 2>/dev/null || true
+          pkill -KILL -f 'scripts/monitor.py' 2>/dev/null || true
+          if tmux has-session -t {{.SESSION}} 2>/dev/null; then
+            tmux kill-session -t {{.SESSION}}
+          fi
+          echo "grid stopped"
+
+  restart:
+    desc: stop and relaunch in paper mode
+    cmds:
+      - task: stop
+      - task: run-paper
+
+  # ---------------------------------------------------------------
+  # Report + tail helpers
+  # ---------------------------------------------------------------
+  report:
+    desc: print the paper performance report + what-if replay
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          uv run python scripts/report.py --replay 2 3 4
+
+  report:fire-quality:
+    desc: print only the fire-quality section (less noisy, good for tracking)
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          uv run python scripts/report.py --replay 2>&1 | \
+            awk '/── Fire quality/,/── /' | sed '$d'
+
+  tail:ledger:
+    desc: tail the grid_fires / entries / exits / audit ledger
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          tail -F "{{.LEDGER}}/grid_fires.jsonl" \
+            "{{.LEDGER}}/entries.jsonl" \
+            "{{.LEDGER}}/exits.jsonl" \
+            "{{.LEDGER}}/audit_log.jsonl"
+
+  tail:log:
+    desc: tail the latest human grid log
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          tail -F "{{.LOGDIR}}/grid-latest.log"
+
+  # ---------------------------------------------------------------
+  # Monitor
+  # ---------------------------------------------------------------
+  monitor:
+    desc: start the stability monitor in the background (5-min interval, anomaly detection on)
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          mkdir -p "{{.LOGDIR}}"
+          nohup uv run python scripts/monitor.py 300 \
+            > "{{.LOGDIR}}/monitor-stdout.log" 2>&1 &
+          disown
+          echo "monitor started; output in {{.LOGDIR}}/monitor.jsonl"
+
+  metrics:
+    desc: print the current counters snapshot from state/metrics.json
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          if [ -f "{{.ROOT}}/state/metrics.json" ]; then
+            cat "{{.ROOT}}/state/metrics.json"
+          else
+            echo "no state/metrics.json yet; grid has not written one"
+          fi
+
+  reload:
+    desc: SIGHUP the grid process so it re-reads runtime-reloadable config fields
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          pkill -HUP -f 'python.*grid_main.py' || {
+            echo "no grid_main.py process found" >&2
+            exit 1
+          }
+          echo "SIGHUP sent; check the log for 'runtime config reloaded'"

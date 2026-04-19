@@ -1,0 +1,38 @@
+---
+# Top-level task runner for the eight-word detector grid.
+#
+# Includes:
+#   * taskfiles/grid.yml  -- lifecycle (run-paper / run-live / stop /
+#                            restart), report, tail, monitor.
+#   * taskfiles/test.yml  -- pytest + lint entry points.
+#
+# Common usage:
+#   task --list
+#   task test
+#   task grid:run-paper
+#   task grid:report
+#   task grid:stop
+
+version: "3"
+
+dotenv:
+  - .env
+
+includes:
+  test:
+    taskfile: ./taskfiles/test.yml
+    dir: .
+  grid:
+    taskfile: ./taskfiles/grid.yml
+    dir: .
+
+tasks:
+  default:
+    cmds:
+      - task --list --sort=alphanumeric
+    silent: true
+
+  test:
+    desc: run the full pytest suite
+    cmds:
+      - task: test:default

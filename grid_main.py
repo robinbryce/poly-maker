@@ -12,6 +12,7 @@ a grid_config.json with "mode": "live") to enable real execution.
 import asyncio
 import gc
 import json
+import logging
 import os
 import sys
 import threading
@@ -22,24 +23,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── config ──────────────────────────────────────────────────────────
+# ── config ───────────────────────────────────────────────────────────
 
 from grid.config import GridConfig
+from grid.logging_setup import configure_logging
+from grid.metrics import counters
 
 _cfg_path = os.environ.get("GRID_CONFIG", "grid_config.json")
 if os.path.isfile(_cfg_path):
     config = GridConfig.from_json(_cfg_path)
-    print(f"[grid] loaded config from {_cfg_path}")
 else:
     config = GridConfig.from_env()
-    print("[grid] loaded config from environment (defaults where unset)")
+
+# P5: install structured logging before anything else emits output.
+configure_logging(level=config.log_level, log_dir=config.log_dir)
+logger = logging.getLogger("grid_main")
+
+if os.path.isfile(_cfg_path):
+    logger.info("loaded config from %s", _cfg_path)
+else:
+    logger.info("loaded config from environment (defaults where unset)")
 
 # P2: fail fast if the deployment slice is inconsistent (e.g. live
 # mode without PK / live_armed).  Paper mode is always accepted.
 config.validate_for_deployment()
 
-print(f"[grid] mode={config.mode}  kill_switch={config.kill_switch}  "
-      f"live_armed={config.live_armed}  min_signals={config.min_signals}")
+logger.info(
+    "mode=%s kill_switch=%s live_armed=%s min_signals=%s",
+    config.mode, config.kill_switch, config.live_armed, config.min_signals,
+    extra={
+        "mode": config.mode,
+        "kill_switch": config.kill_switch,
+        "live_armed": config.live_armed,
+        "min_signals": config.min_signals,
+    },
+)
 
 # ── infrastructure ──────────────────────────────────────────────────
 
@@ -391,6 +409,31 @@ async def _periodic_snapshot() -> None:
             traceback.print_exc()
 
 
+async def _periodic_metrics() -> None:
+    """Every 60s write the counters snapshot to state/metrics.json
+    and emit a summary row into the structured log every 5 minutes
+    so the JSONL log has a durable timeline of the counters.
+    """
+    metrics_path = os.path.join(config.state_dir, "metrics.json")
+    tick = 0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            counters.write_snapshot(metrics_path)
+        except Exception:
+            logger.exception("metrics snapshot write failed")
+        tick += 1
+        if tick % 5 == 0:
+            try:
+                snap = counters.snapshot()
+                logger.info(
+                    "metrics tick",
+                    extra={"event": "metrics_tick", "counters": snap},
+                )
+            except Exception:
+                logger.exception("metrics tick log failed")
+
+
 def _save_snapshot() -> None:
     snapshot_store.save({
         "coordinator": coordinator.snapshot(),
@@ -516,6 +559,7 @@ async def main() -> None:
     # Async background tasks.
     poll_task = asyncio.create_task(_periodic_pollers())
     snap_task = asyncio.create_task(_periodic_snapshot())
+    metrics_task = asyncio.create_task(_periodic_metrics())
 
     async def ws_loop():
         while not stop_event.is_set():
@@ -530,10 +574,16 @@ async def main() -> None:
 
     ws_task = asyncio.create_task(ws_loop())
     await stop_event.wait()
-    for t in (poll_task, snap_task, ws_task):
+    for t in (poll_task, snap_task, metrics_task, ws_task):
         t.cancel()
     # Final flush.
     _save_snapshot()
+    try:
+        counters.write_snapshot(
+            os.path.join(config.state_dir, "metrics.json")
+        )
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

@@ -155,10 +155,88 @@ def fmt(snap: dict) -> str:
     )
 
 
-def main(interval: float = 60.0) -> None:
+# ── anomaly detection (pure helpers, unit-tested) ─────────────────
+
+STUCK_WINDOW = 12       # number of prior samples for the median.
+STUCK_MULT = 5.0        # current delta > mult * median = suspicious.
+STUCK_MIN_ABS = 50      # but only if the delta is materially large.
+DEAD_CONSEC = 3         # consecutive zero-delta samples = dead loop.
+
+
+def detect_anomaly(samples: list[dict]) -> list[dict]:
+    """Inspect the tail of ``samples`` (oldest first) and return any
+    anomalies triggered by the latest sample.
+
+    Each anomaly is ``{"kind": str, "detail": str, "metrics": {...}}``
+    where ``kind`` is ``"stuck_loop_suspected"`` or
+    ``"no_signal_flow"``.
+    """
+    out: list[dict] = []
+    if not samples:
+        return out
+    latest = samples[-1]
+    delta = int(latest.get("signal_fires_delta", 0) or 0)
+
+    # Stuck loop: latest delta >> rolling median of prior deltas.
+    prior = [
+        int(s.get("signal_fires_delta", 0) or 0)
+        for s in samples[-(STUCK_WINDOW + 1):-1]
+    ]
+    if prior:
+        med = _median(prior)
+        if (
+            delta >= STUCK_MIN_ABS
+            and med > 0
+            and delta > med * STUCK_MULT
+        ):
+            out.append({
+                "kind": "stuck_loop_suspected",
+                "detail": (
+                    f"signal_fires_delta={delta} > {STUCK_MULT:.0f}× "
+                    f"median({med:.0f}) over last {len(prior)} samples"
+                ),
+                "metrics": {
+                    "delta": delta, "median": med,
+                    "samples": len(prior),
+                },
+            })
+
+    # Dead loop: last N samples all zero delta.
+    tail = samples[-DEAD_CONSEC:]
+    if len(tail) == DEAD_CONSEC and all(
+        int(s.get("signal_fires_delta", 0) or 0) == 0 for s in tail
+    ):
+        out.append({
+            "kind": "no_signal_flow",
+            "detail": (
+                f"signal_fires_delta was zero for the last "
+                f"{DEAD_CONSEC} samples"
+            ),
+            "metrics": {"consecutive_zero": DEAD_CONSEC},
+        })
+
+    return out
+
+
+def _median(xs: list[int]) -> float:
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return float(s[mid])
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+# ── main loop ────────────────────────────────────────────────────────────
+
+def main(interval: float = 60.0, *, anomaly: bool = True) -> None:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     prev = None
-    print(f"[monitor] writing snapshots to {OUT} every {interval:.0f}s")
+    history: list[dict] = []
+    print(f"[monitor] writing snapshots to {OUT} every {interval:.0f}s "
+          f"anomaly={anomaly}")
     while True:
         try:
             snap = snapshot(prev)
@@ -171,10 +249,19 @@ def main(interval: float = 60.0) -> None:
             print(f"[monitor] error: {snap['error']}")
         else:
             print(fmt(snap))
+            if anomaly:
+                history.append(snap)
+                # Keep the tail bounded.
+                if len(history) > STUCK_WINDOW + 4:
+                    history = history[-(STUCK_WINDOW + 4):]
+                for a in detect_anomaly(history):
+                    print(f"[monitor] ANOMALY {a['kind']}: {a['detail']}")
         prev = snap
         time.sleep(interval)
 
 
 if __name__ == "__main__":
-    i = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
-    main(i)
+    args = sys.argv[1:]
+    interval = float(args[0]) if args and args[0].replace(".", "").isdigit() else 60.0
+    anomaly = "--no-anomaly" not in args
+    main(interval, anomaly=anomaly)

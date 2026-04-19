@@ -1,0 +1,31 @@
+---
+# Test targets for the eight-word detector grid.
+
+version: "3"
+
+tasks:
+  default:
+    desc: run the full pytest suite
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          uv run pytest -q
+
+  unit:
+    desc: run only the fast unit tests (skip network/integration marks)
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          uv run pytest -q -m "not integration and not network"
+
+  lint:
+    desc: run ruff lint + format check when ruff is available
+    cmds:
+      - cmd: |
+          set -euo pipefail
+          if uv run --quiet ruff --version >/dev/null 2>&1; then
+            uv run ruff check .
+            uv run ruff format --check .
+          else
+            echo "ruff not installed in the uv env, skipping"
+          fi
