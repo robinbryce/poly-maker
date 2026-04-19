@@ -68,13 +68,19 @@ class PaperExecutor:
         self.config = config
         self._ledger = ledger
         self._positions: dict[str, dict] = {}
-        self._lock = asyncio.Lock()
+        # P6: lazy lock, same reason as in the coordinator.
+        self._lock: Optional[asyncio.Lock] = None
         self._exit_strategy: ExitStrategy = (
             exit_strategy or CentThresholdStrategy(config)
         )
         self._hours_to_resolution = (
             hours_to_resolution or (lambda _m: None)
         )
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def snapshot(self) -> dict:
         return {"positions": dict(self._positions)}
@@ -86,7 +92,7 @@ class PaperExecutor:
         self, market: str, token_id: str, direction: Direction,
         confidence: float, meta: dict, correlation_id: str,
     ) -> ExecutionResult:
-        async with self._lock:
+        async with self._get_lock():
             return self._enter_inner(market, token_id, direction, meta, correlation_id)
 
     def enter_sync(
@@ -261,7 +267,7 @@ class PaperExecutor:
         return set(self._positions.keys())
 
     async def check_exits(self) -> List[Tuple[str, float]]:
-        async with self._lock:
+        async with self._get_lock():
             return self._check_exits_inner()
 
     def check_exits_sync(self) -> List[Tuple[str, float]]:

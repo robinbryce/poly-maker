@@ -127,7 +127,18 @@ class LedgerStore:
             return
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         stem, ext = os.path.splitext(filename)
-        os.rename(path, os.path.join(self._dir, f"{stem}.{stamp}{ext}"))
+        base = os.path.join(self._dir, f"{stem}.{stamp}{ext}")
+        dest = base
+        # Guard against sub-second collisions: if two rotations fall in
+        # the same wall-clock second, tack on an incrementing suffix
+        # so we never silently overwrite a prior rotated file.
+        suffix = 1
+        while os.path.exists(dest):
+            dest = os.path.join(
+                self._dir, f"{stem}.{stamp}.{suffix}{ext}"
+            )
+            suffix += 1
+        os.rename(path, dest)
 
     def _get_lock(self, filename: str) -> threading.Lock:
         with self._locks_mutex:

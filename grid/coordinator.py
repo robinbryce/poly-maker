@@ -53,7 +53,17 @@ class Coordinator:
         self.fires_by_detector: Counter = Counter()
         self.grid_contributions_by_detector: Counter = Counter()
 
-        self._lock = asyncio.Lock()
+        # P6: lazy lock allocation.  Py3.9's ``asyncio.Lock()`` binds
+        # to the running loop at construction time, which means
+        # constructing a ``Coordinator`` outside an async context (or
+        # after ``asyncio.run()`` tore one down) raised.  Defer until
+        # the first async method actually needs it.
+        self._lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     # snapshot / restore --------------------------------------------
 
@@ -108,7 +118,7 @@ class Coordinator:
     # ingest --------------------------------------------------------
 
     async def ingest(self, fires: List[SignalFire]) -> None:
-        async with self._lock:
+        async with self._get_lock():
             self._maybe_daily_reset()
             for fire in fires:
                 self.fires_by_detector[fire.detector_name] += 1
@@ -272,7 +282,7 @@ class Coordinator:
     # lifecycle -----------------------------------------------------
 
     async def mark_closed(self, market: str, pnl_usdc: float) -> None:
-        async with self._lock:
+        async with self._get_lock():
             self._mark_closed_inner(market, pnl_usdc)
 
     def mark_closed_sync(self, market: str, pnl_usdc: float) -> None:
@@ -311,7 +321,7 @@ class Coordinator:
     # reconciliation ------------------------------------------------
 
     async def reconcile_open_markets(self, actually_open) -> int:
-        async with self._lock:
+        async with self._get_lock():
             return self._reconcile_inner(actually_open)
 
     def reconcile_open_markets_sync(self, actually_open) -> int:
