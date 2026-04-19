@@ -216,7 +216,62 @@ def mark_to_market(entries, exits) -> dict:
     }
 
 
-# ── section: what-if replay at a different min-signals ─────────────
+# ── section: fire quality (P4) ──────────────────────────────────
+
+def fire_quality(signal_fires: List[dict], grid_fires: List[dict]) -> dict:
+    """Per-detector fires and grid contributions from the ledger.
+
+    Mirrors ``Coordinator.fire_quality_report`` but computed offline
+    from the JSON-lines ledger, so the report works without a live
+    grid process.  ``grid_fires`` records don't list the contributing
+    detectors directly; we reconstruct the set of detectors active
+    on the grid fire's market within ``staleness_secs`` of the grid
+    fire timestamp.
+    """
+    from collections import Counter
+
+    total = Counter()
+    for f in signal_fires:
+        total[f.get("detector", "unknown")] += 1
+
+    contributions: Counter = Counter()
+    # Build a lookup of signal fires per market (sorted by ts).
+    by_market: Dict[str, List[dict]] = collections.defaultdict(list)
+    for f in signal_fires:
+        by_market[f["market"]].append(f)
+    for lst in by_market.values():
+        lst.sort(key=lambda f: f["ts"])
+
+    staleness_secs = 300.0
+    for g in grid_fires:
+        market = g.get("market")
+        g_ts = float(g.get("ts", 0))
+        fires = by_market.get(market, [])
+        active: dict = {}
+        for f in fires:
+            if f["ts"] > g_ts:
+                break
+            if g_ts - f["ts"] > staleness_secs:
+                continue
+            active[f["detector"]] = True
+        for d in active:
+            contributions[d] += 1
+
+    names = set(total) | set(contributions)
+    out = {}
+    for n in sorted(names):
+        fires = total[n]
+        contrib = contributions[n]
+        rate = (contrib / fires) if fires else 0.0
+        out[n] = {
+            "fires": fires,
+            "contributions": contrib,
+            "quality_pct": rate * 100.0,
+        }
+    return out
+
+
+# ── section: what-if replay at a different min-signals ───────────
 
 def replay(
     signal_fires: List[dict],
@@ -350,6 +405,22 @@ def print_report(ledger_dir: Path, replay_with: Optional[List[int]] = None) -> N
             print(f"  {p['direction']} {p['market'][:12]}…  "
                   f"entry={p['entry_price']:.3f} mark={p['mark_price']:.3f} "
                   f"size={p['size']:.1f}  pnl={_usd(p['unrealised'])}")
+
+    _section("Fire quality")
+    fq = fire_quality(signal_fires, grid_fires)
+    if not fq:
+        print("no signal fires yet")
+    else:
+        # Sort by raw fire count desc for readability.
+        rows = sorted(fq.items(), key=lambda kv: kv[1]["fires"], reverse=True)
+        name_w = max(len(n) for n, _ in rows)
+        for name, stats in rows:
+            print(
+                f"  {name.ljust(name_w)}  "
+                f"fires={stats['fires']:>8,}  "
+                f"contrib={stats['contributions']:>5,}  "
+                f"rate={stats['quality_pct']:>6.2f}%"
+            )
 
     if replay_with:
         _section("What-if replay (offline)")

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+from collections import Counter
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set
 
 from detectors.base import Direction, SignalFire
@@ -43,6 +44,14 @@ class Coordinator:
         self.consecutive_losses: int = 0
         self._last_reset_utc_date = self._today_utc()
 
+        # P4: fire-quality counters.  fires_by_detector counts every
+        # signal fire ingested; grid_contributions_by_detector counts
+        # the times each detector appeared in a grid fire's active set.
+        # fire_quality_report() divides them for an operator-visible
+        # contribution rate.
+        self.fires_by_detector: Counter = Counter()
+        self.grid_contributions_by_detector: Counter = Counter()
+
         self._lock = asyncio.Lock()
 
     # snapshot / restore --------------------------------------------
@@ -54,6 +63,9 @@ class Coordinator:
             "daily_loss_usdc": self.daily_loss_usdc,
             "consecutive_losses": self.consecutive_losses,
             "last_reset_utc_date": self._last_reset_utc_date,
+            "fires_by_detector": dict(self.fires_by_detector),
+            "grid_contributions_by_detector":
+                dict(self.grid_contributions_by_detector),
         }
 
     def restore(self, data: dict) -> None:
@@ -64,6 +76,33 @@ class Coordinator:
         self._last_reset_utc_date = data.get(
             "last_reset_utc_date", self._today_utc()
         )
+        self.fires_by_detector = Counter(data.get("fires_by_detector", {}))
+        self.grid_contributions_by_detector = Counter(
+            data.get("grid_contributions_by_detector", {})
+        )
+
+    # fire quality --------------------------------------------------
+
+    def fire_quality_report(self) -> Dict[str, Dict[str, float]]:
+        """Per-detector fires, grid contributions and contribution
+        rate.  Rate is ``contributions / fires`` when ``fires > 0``.
+        Detectors with zero fires are included so the operator can
+        see that they are silent.
+        """
+        names = set(self.fires_by_detector) | set(
+            self.grid_contributions_by_detector
+        )
+        report: Dict[str, Dict[str, float]] = {}
+        for name in sorted(names):
+            fires = int(self.fires_by_detector.get(name, 0))
+            contrib = int(self.grid_contributions_by_detector.get(name, 0))
+            rate = (contrib / fires) if fires > 0 else 0.0
+            report[name] = {
+                "fires": fires,
+                "contributions": contrib,
+                "quality_pct": rate * 100.0,
+            }
+        return report
 
     # ingest --------------------------------------------------------
 
@@ -71,6 +110,7 @@ class Coordinator:
         async with self._lock:
             self._maybe_daily_reset()
             for fire in fires:
+                self.fires_by_detector[fire.detector_name] += 1
                 self._state.get(fire.market).update(fire)
                 if self._ledger:
                     self._ledger.log_signal_fire(fire)
@@ -84,6 +124,7 @@ class Coordinator:
     def ingest_sync(self, fires: List[SignalFire]) -> None:
         self._maybe_daily_reset()
         for fire in fires:
+            self.fires_by_detector[fire.detector_name] += 1
             self._state.get(fire.market).update(fire)
             if self._ledger:
                 self._ledger.log_signal_fire(fire)
@@ -187,6 +228,10 @@ class Coordinator:
         fire_price = self._get_midpoint(market)
         if fire_price is not None:
             meta["fire_price"] = float(fire_price)
+        # P4: credit every active detector with this grid fire so
+        # fire_quality_report() can separate contributors from noise.
+        for f in active:
+            self.grid_contributions_by_detector[f.detector_name] += 1
         return (direction, agreement, active, token_id, cid, category,
                 avg_confidence, meta, agreement)
 

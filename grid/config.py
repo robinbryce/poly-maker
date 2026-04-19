@@ -63,9 +63,13 @@ class RuntimeConfig:
     max_open_per_category: int
     volume_spike_multiplier: float
     velocity_threshold: float
+    velocity_min_book_depth: float
     disposition_threshold: float
     cross_market_delta_cents: float
     news_delta_cents: float
+    news_short_horizon_hours: float
+    news_long_horizon_hours: float
+    news_far_weight: float
     theta_hours: float
     book_drift_bps: float
     max_slippage_bps: float
@@ -123,7 +127,13 @@ class GridConfig:
     volume_spike_multiplier: float = 3.0
 
     # Velocity: minimum absolute price change per second (normalised).
-    velocity_threshold: float = 0.002
+    # P4: raised from 0.002 to 0.005 — the 0.002 default was firing
+    # near-constantly on thin-book flicker in the 4-hour paper run.
+    velocity_threshold: float = 0.005
+
+    # P4: minimum top-of-book depth (smaller side, in tokens) required
+    # for velocity to fire.  Filters out thin-book flicker.
+    velocity_min_book_depth: float = 50.0
 
     # Disposition: net taker aggression ratio to fire.
     disposition_threshold: float = 0.6
@@ -133,6 +143,15 @@ class GridConfig:
 
     # News / oracle: minimum feed-vs-market delta in cents to fire.
     news_delta_cents: float = 5.0
+
+    # P4: time-to-resolution weighting for news fires.  Within
+    # ``news_short_horizon_hours`` of resolution the signal gets full
+    # weight.  Beyond ``news_long_horizon_hours`` it is discounted to
+    # ``news_far_weight``.  Linear interpolation in between.  When the
+    # market's resolution time is unknown the midpoint weight is used.
+    news_short_horizon_hours: float = 1.0
+    news_long_horizon_hours: float = 18.0
+    news_far_weight: float = 0.3
 
     # Theta: hours-before-resolution pressure window.
     theta_hours: float = 48.0
@@ -234,8 +253,10 @@ class GridConfig:
         "max_entry_usdc", "max_open_positions", "daily_loss_cap_usdc",
         "consecutive_loss_cap", "max_open_per_category",
         "volume_spike_multiplier", "velocity_threshold",
-        "disposition_threshold", "cross_market_delta_cents",
-        "news_delta_cents", "theta_hours", "book_drift_bps",
+        "velocity_min_book_depth", "disposition_threshold",
+        "cross_market_delta_cents", "news_delta_cents",
+        "news_short_horizon_hours", "news_long_horizon_hours",
+        "news_far_weight", "theta_hours", "book_drift_bps",
         "max_slippage_bps", "exit_tp_cents", "exit_sl_cents",
         "exit_tighten_hours", "exit_tighten_factor",
     })

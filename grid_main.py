@@ -71,11 +71,24 @@ from detectors.theta import ThetaDetector
 volume_det = VolumeDetector(config)
 velocity_det = VelocityDetector(config)
 disposition_det = DispositionDetector(config)
-news_det = NewsDetector(config)
 cross_market_det = CrossMarketDetector(config)
 whale_det = WhaleDetector(config)
 category_det = CategoryDetector(config)
 theta_det = ThetaDetector(config)
+
+
+def _news_hours_to_resolution(market: str):
+    """Hours-to-resolution lookup for the news detector.  Uses the
+    theta detector's end-date index, which gamma_discovery populates
+    for every tracked market."""
+    import time
+    end_epoch = theta_det._end_dates.get(market)
+    if end_epoch is None:
+        return None
+    return max(0.0, (end_epoch - time.time()) / 3600.0)
+
+
+news_det = NewsDetector(config, hours_to_resolution=_news_hours_to_resolution)
 
 all_detectors = [
     volume_det, velocity_det, disposition_det,
@@ -229,16 +242,29 @@ from poly_data.public_client import PublicPolymarketClient
 
 
 def _enrich_event(json_data: dict) -> dict:
-    """Add midpoint to events when we can compute it from the book."""
+    """Add midpoint and top-of-book size to events.
+
+    ``top_of_book_size`` is the smaller of the best-bid and best-ask
+    sizes at the event moment — used by the P4 velocity depth gate
+    to filter thin-book flicker.
+    """
     market = json_data.get("market", "")
     book = global_state.all_data.get(market)
-    if book and "midpoint" not in json_data:
+    if book:
         bids = book.get("bids")
         asks = book.get("asks")
         if bids and asks and len(bids) > 0 and len(asks) > 0:
             best_bid = float(max(bids.keys()))
             best_ask = float(min(asks.keys()))
-            json_data["midpoint"] = (best_bid + best_ask) / 2
+            if "midpoint" not in json_data:
+                json_data["midpoint"] = (best_bid + best_ask) / 2
+            if "top_of_book_size" not in json_data:
+                try:
+                    bid_size = float(bids[best_bid])
+                    ask_size = float(asks[best_ask])
+                    json_data["top_of_book_size"] = min(bid_size, ask_size)
+                except (TypeError, ValueError, KeyError):
+                    pass
     return json_data
 
 

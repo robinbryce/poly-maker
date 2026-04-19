@@ -10,7 +10,7 @@ detector compares the latest feed value against the market midpoint.
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from detectors.base import BaseDetector, Direction, SignalFire
 from grid.config import GridConfig
@@ -19,13 +19,22 @@ from grid.config import GridConfig
 class NewsDetector(BaseDetector):
     name = "news"
 
-    def __init__(self, config: GridConfig):
+    def __init__(
+        self,
+        config: GridConfig,
+        hours_to_resolution: Optional[Callable[[str], Optional[float]]] = None,
+    ):
         self.config = config
         # Populated by feeds.oracle via set_feed_value()
         # {market: {"value": float, "ts": float, "source": str}}
         self._feed_values: Dict[str, dict] = {}
         # Latest observed midpoints from the websocket layer
         self._midpoints: Dict[str, float] = {}
+        # P4: optional hours-to-resolution callback used for
+        # time-weighting.  Defaults to None — no weighting — when not
+        # provided, which preserves pre-P4 behaviour for callers that
+        # don't know the market's resolution time.
+        self._hours_to_resolution = hours_to_resolution
 
     # ── streaming side: track midpoints ─────────────────────────────
 
@@ -59,7 +68,40 @@ class NewsDetector(BaseDetector):
             "source": source,
         }
 
-    # ── core logic ──────────────────────────────────────────────────
+    # ── time weighting ─────────────────────────────────────────────
+
+    def _time_weight(self, market: str) -> float:
+        """Return the confidence multiplier for a news fire.
+
+        A news gap near resolution is a stronger bet than the same
+        gap 18 hours out.  Within ``news_short_horizon_hours`` the
+        weight is 1.0; beyond ``news_long_horizon_hours`` it floors
+        at ``news_far_weight``; linear in between.  When we can't
+        determine the horizon the midpoint of near and far weights
+        is used so news still contributes something on unknown
+        markets.
+        """
+        short_h = float(getattr(self.config, "news_short_horizon_hours", 0.0) or 0.0)
+        long_h = float(getattr(self.config, "news_long_horizon_hours", 0.0) or 0.0)
+        far = float(getattr(self.config, "news_far_weight", 1.0))
+        # Defensive: if the config somehow has near > far, swap so the
+        # interpolation stays well-defined.
+        if long_h < short_h:
+            short_h, long_h = long_h, short_h
+
+        if self._hours_to_resolution is None:
+            return 1.0
+        hours_left = self._hours_to_resolution(market)
+        if hours_left is None:
+            return (1.0 + far) / 2.0
+        if hours_left <= short_h:
+            return 1.0
+        if hours_left >= long_h or long_h <= short_h:
+            return far
+        t = (hours_left - short_h) / (long_h - short_h)
+        return 1.0 - t * (1.0 - far)
+
+    # ── core logic ───────────────────────────────────────────────
 
     def _evaluate(self, market: str, token_id: str) -> List[SignalFire]:
         feed = self._feed_values.get(market)
@@ -72,7 +114,9 @@ class NewsDetector(BaseDetector):
             return []
 
         direction = Direction.BUY if delta_cents > 0 else Direction.SELL
-        confidence = min(abs(delta_cents) / (self.config.news_delta_cents * 3), 1.0)
+        base_conf = min(abs(delta_cents) / (self.config.news_delta_cents * 3), 1.0)
+        time_weight = self._time_weight(market)
+        confidence = max(0.0, min(1.0, base_conf * time_weight))
 
         return [SignalFire(
             detector_name=self.name,
@@ -80,7 +124,11 @@ class NewsDetector(BaseDetector):
             token_id=token_id,
             direction=direction,
             confidence=confidence,
-            meta={"delta_cents": delta_cents, "source": feed["source"]},
+            meta={
+                "delta_cents": delta_cents,
+                "source": feed["source"],
+                "time_weight": time_weight,
+            },
         )]
 
     def reset(self, market: str) -> None:

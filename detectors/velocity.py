@@ -58,6 +58,20 @@ class VelocityDetector(BaseDetector):
         if long_rate > 0 and short_rate < long_rate * 2:
             return []
 
+        # P4: depth gate — refuse to fire on thin-book flicker.  The
+        # enricher in ``grid_main`` puts ``top_of_book_size`` on book /
+        # price_change events (the smaller of best-bid and best-ask
+        # size).  Older events without the field pass through.
+        depth = event.get("top_of_book_size")
+        min_depth = float(getattr(self.config, "velocity_min_book_depth", 0.0))
+        if depth is not None and min_depth > 0:
+            try:
+                depth_f = float(depth)
+            except (TypeError, ValueError):
+                depth_f = 0.0
+            if depth_f < min_depth:
+                return []
+
         direction = Direction.BUY if short_delta > 0 else Direction.SELL
         confidence = min(short_rate / max(self.config.velocity_threshold, 1e-9), 1.0)
 
